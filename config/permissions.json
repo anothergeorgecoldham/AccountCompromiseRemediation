@@ -1,0 +1,50 @@
+{
+  "description": "Required Microsoft Graph API permissions for Account Compromise Remediation scripts",
+  "delegatedPermissions": {
+    "description": "Used by the interactive script (Invoke-AccountRemediation.ps1) with interactive browser login",
+    "scopes": [
+      "User.ReadWrite.All",
+      "Directory.ReadWrite.All",
+      "AuditLog.Read.All",
+      "MailboxSettings.ReadWrite",
+      "Mail.ReadWrite",
+      "Calendars.ReadWrite",
+      "Sites.ReadWrite.All",
+      "UserAuthenticationMethod.ReadWrite.All",
+      "RoleManagement.Read.Directory",
+      "Application.ReadWrite.All",
+      "Policy.ReadWrite.ConditionalAccess",
+      "DeviceManagementManagedDevices.ReadWrite.All"
+    ]
+  },
+  "applicationPermissions": {
+    "description": "Used by the non-interactive script (Invoke-AutoRemediation.ps1) with Managed Identity",
+    "scopes": [
+      "User.ReadWrite.All",
+      "Directory.ReadWrite.All",
+      "AuditLog.Read.All",
+      "MailboxSettings.ReadWrite",
+      "Mail.ReadWrite",
+      "Calendars.ReadWrite",
+      "Sites.ReadWrite.All",
+      "UserAuthenticationMethod.ReadWrite.All",
+      "RoleManagement.Read.Directory",
+      "Application.ReadWrite.All",
+      "Policy.ReadWrite.ConditionalAccess",
+      "DeviceManagementManagedDevices.ReadWrite.All"
+    ]
+  },
+  "exchangeOnline": {
+    "description": "Exchange Online PowerShell permissions required for mailbox and transport rule operations",
+    "roles": [
+      "Mail Recipients",
+      "Transport Rules",
+      "Journaling",
+      "Organization Management"
+    ]
+  },
+  "powerPlatform": {
+    "description": "Power Platform admin permissions required for Power Automate and Power Apps remediation",
+    "notes": "Requires Power Platform admin role or Environment Admin role. Uses Power Platform admin connectors via Microsoft Graph where available, otherwise Power Apps Management module."
+  }
+}
