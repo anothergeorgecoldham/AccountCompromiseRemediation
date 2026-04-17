@@ -1,0 +1,21 @@
+# Runtime output & tenant data — NEVER COMMIT (contains PII, audit data, credentials)
+forensics/
+output/
+logs/
+rollback/
+CREDENTIALS/
+**/CREDENTIALS/
+**/password-*.txt
+
+# Local settings / editor
+.vscode/
+.idea/
+*.user
+*.suo
+
+# PowerShell
+*.ps1xml.bak
+
+# OS
+Thumbs.db
+.DS_Store

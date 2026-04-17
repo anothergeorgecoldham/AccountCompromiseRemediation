@@ -3,6 +3,8 @@
 PowerShell-based toolkit for remediating compromised Entra ID accounts. Provides both interactive and automated workflows to investigate and remediate account compromise incidents.
 
 > **New here?** Start with the [Getting Started Guide](getting-started.md) for prerequisites, security best practices, Azure deployment, and Sentinel/Defender XDR integration.
+>
+> **Hitting an issue?** See the [Troubleshooting Guide](troubleshooting.md) for common failure modes and solutions.
 
 ## Prerequisites
 
@@ -36,7 +38,12 @@ PowerShell-based toolkit for remediating compromised Entra ID accounts. Provides
 
 # Skip forensic investigation
 .\src\Invoke-AccountRemediation.ps1 -UserPrincipalName "user@contoso.com" -RunAll -SkipForensics
+
+# Skip preflight validation (not recommended — only use if preflight has false positives)
+.\src\Invoke-AccountRemediation.ps1 -UserPrincipalName "user@contoso.com" -RunAll -SkipPreflight
 ```
+
+> **💡 Preflight validation** runs automatically before any remediation. It verifies PowerShell version, module installations, Graph/EXO connectivity, operator admin roles, and target user existence. Blocking issues abort the run; warnings prompt for confirmation.
 
 ### Non-Interactive / Automation Mode
 ```powershell

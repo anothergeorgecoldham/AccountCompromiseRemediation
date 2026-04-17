@@ -3,14 +3,17 @@
 Describe 'ACR.Forensics Module' {
 
     BeforeAll {
-        # Ensure stub functions exist for Graph cmdlets not installed locally
+        # Ensure stub functions exist for Graph and EXO cmdlets not installed locally
         $graphStubs = @(
             'Get-MgAuditLogSignIn', 'Get-MgAuditLogDirectoryAudit',
-            'Get-MgUser', 'Get-MgUserMailboxSetting',
-            'Get-MgUserMailFolderPermission', 'Get-MgUserMailFolderMessageRule',
-            'Get-MgUserMailFolder'
+            'Get-MgUser'
         )
-        foreach ($cmd in $graphStubs) {
+        $exoStubs = @(
+            'Get-Mailbox', 'Get-MailboxFolderPermission', 'Get-InboxRule',
+            'Get-MailboxPermission', 'Search-UnifiedAuditLog',
+            'Get-OrganizationConfig', 'Test-ACRExchangeOnlineConnected'
+        )
+        foreach ($cmd in ($graphStubs + $exoStubs)) {
             if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
                 Set-Item -Path "function:global:$cmd" -Value { }
             }
@@ -84,22 +87,17 @@ Describe 'ACR.Forensics Module' {
     Context 'Get-ACRMailboxAudit' {
 
         It 'Collects delegates, rules, and forwarding config' {
-            Mock Get-MgUserMailboxSetting -ModuleName ACR.Forensics {
+            Mock Test-ACRExchangeOnlineConnected -ModuleName ACR.Forensics { return $true }
+            Mock Get-Mailbox -ModuleName ACR.Forensics {
                 [PSCustomObject]@{
-                    AutomaticRepliesSetting = [PSCustomObject]@{
-                        Status               = 'Disabled'
-                        ExternalReplyMessage = ''
-                        InternalReplyMessage = ''
-                        ExternalAudience     = 'None'
-                    }
+                    ForwardingSmtpAddress      = $null
+                    ForwardingAddress          = $null
+                    DeliverToMailboxAndForward  = $false
                 }
             }
-            Mock Get-MgUserMailFolderPermission -ModuleName ACR.Forensics { return @() }
-            Mock Get-MgUserMailFolderMessageRule -ModuleName ACR.Forensics { return @() }
-            Mock Get-MgUser -ModuleName ACR.Forensics {
-                [PSCustomObject]@{ Id = 'user-id-1'; MailboxSettings = @{} }
-            }
-            Mock Get-MgUserMailFolder -ModuleName ACR.Forensics { return @() }
+            Mock Get-MailboxFolderPermission -ModuleName ACR.Forensics { return @() }
+            Mock Get-InboxRule -ModuleName ACR.Forensics { return @() }
+            Mock Get-MailboxPermission -ModuleName ACR.Forensics { return @() }
 
             $result = Get-ACRMailboxAudit -UserPrincipalName 'user@contoso.com'
 
@@ -114,7 +112,8 @@ Describe 'ACR.Forensics Module' {
     Context 'Get-ACRUnifiedAuditLog' {
 
         It 'Handles missing ExchangeOnlineManagement gracefully' {
-            # Do not define Search-UnifiedAuditLog — simulates module not loaded
+            Mock Test-ACRExchangeOnlineConnected -ModuleName ACR.Forensics { return $false }
+
             $result = Get-ACRUnifiedAuditLog -UserPrincipalName 'user@contoso.com'
 
             $result.Available | Should -BeFalse
@@ -128,19 +127,17 @@ Describe 'ACR.Forensics Module' {
         BeforeEach {
             Mock Get-MgAuditLogSignIn -ModuleName ACR.Forensics { return @() }
             Mock Get-MgAuditLogDirectoryAudit -ModuleName ACR.Forensics { return @() }
-            Mock Get-MgUserMailboxSetting -ModuleName ACR.Forensics {
+            Mock Test-ACRExchangeOnlineConnected -ModuleName ACR.Forensics { return $true }
+            Mock Get-Mailbox -ModuleName ACR.Forensics {
                 [PSCustomObject]@{
-                    AutomaticRepliesSetting = [PSCustomObject]@{
-                        Status = 'Disabled'; ExternalReplyMessage = ''; InternalReplyMessage = ''; ExternalAudience = 'None'
-                    }
+                    ForwardingSmtpAddress     = $null
+                    ForwardingAddress         = $null
+                    DeliverToMailboxAndForward = $false
                 }
             }
-            Mock Get-MgUserMailFolderPermission -ModuleName ACR.Forensics { return @() }
-            Mock Get-MgUserMailFolderMessageRule -ModuleName ACR.Forensics { return @() }
-            Mock Get-MgUser -ModuleName ACR.Forensics {
-                [PSCustomObject]@{ Id = 'user-id-1'; MailboxSettings = @{} }
-            }
-            Mock Get-MgUserMailFolder -ModuleName ACR.Forensics { return @() }
+            Mock Get-MailboxFolderPermission -ModuleName ACR.Forensics { return @() }
+            Mock Get-InboxRule -ModuleName ACR.Forensics { return @() }
+            Mock Get-MailboxPermission -ModuleName ACR.Forensics { return @() }
         }
 
         It 'Creates forensics output directory' {

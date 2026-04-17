@@ -14,6 +14,7 @@
 $script:RequiredScopes = @(
     'User.ReadWrite.All'
     'Directory.ReadWrite.All'
+    'Directory.AccessAsUser.All'    # Required to write passwordProfile (reset user password)
     'AuditLog.Read.All'
     'MailboxSettings.ReadWrite'
     'Mail.ReadWrite'
@@ -189,21 +190,32 @@ function Disconnect-ACR {
     <#
     .SYNOPSIS
         Disconnects from Microsoft Graph and Exchange Online.
+    .DESCRIPTION
+        Cleans up active sessions. When Exchange Online was connected via device-code
+        fallback (due to the WAM broker bug on this host), Disconnect-ExchangeOnline is
+        skipped because its internal token-cleanup triggers an unhandled async exception
+        that would crash the process. The EXO session will be cleaned up naturally when
+        the PowerShell process exits.
     #>
     [CmdletBinding()]
     param()
 
     try {
-        Disconnect-MgGraph -ErrorAction SilentlyContinue
+        Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
         Write-Verbose "Disconnected from Microsoft Graph."
     }
     catch {
         Write-Verbose "Graph disconnect warning: $_"
     }
 
+    if ($script:ACRExoUsedDeviceCode) {
+        Write-Verbose "Skipping Disconnect-ExchangeOnline (device-code fallback was used; disconnect would trigger a known async crash). Close the shell to fully clean up."
+        return
+    }
+
     try {
         if (Get-Module -Name ExchangeOnlineManagement) {
-            Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
+            Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
             Write-Verbose "Disconnected from Exchange Online."
         }
     }
@@ -240,9 +252,30 @@ function Connect-ACRExchangeOnline {
         if ($UserPrincipalName) { $connectParams['UserPrincipalName'] = $UserPrincipalName }
         Connect-ExchangeOnline @connectParams
         Write-Verbose "Connected to Exchange Online."
+        $script:ACRExoUsedDeviceCode = $false
         return $true
     }
     catch {
+        # Detect the WAM broker NullReferenceException (known issue on some Windows hosts)
+        $errText = "$_"
+        $isWamBug = $errText -match 'NullReferenceException|RuntimeBroker|Object reference not set'
+
+        if ($isWamBug) {
+            Write-Warning "Exchange Online interactive login failed due to a known WAM broker issue. Retrying with device code authentication..."
+            try {
+                $deviceParams = @{ ShowBanner = $false; ErrorAction = 'Stop'; Device = $true }
+                if ($UserPrincipalName) { $deviceParams['UserPrincipalName'] = $UserPrincipalName }
+                Connect-ExchangeOnline @deviceParams
+                Write-Verbose "Connected to Exchange Online via device code."
+                # Flag that we used device code — Disconnect-ExchangeOnline triggers the same WAM bug on a background thread during token cleanup, so we skip disconnect for this path.
+                $script:ACRExoUsedDeviceCode = $true
+                return $true
+            } catch {
+                Write-Warning "Device code fallback also failed: $_"
+                return $false
+            }
+        }
+
         Write-Warning "Failed to connect to Exchange Online: $_"
         return $false
     }

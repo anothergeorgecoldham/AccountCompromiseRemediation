@@ -3,16 +3,23 @@
 Describe 'ACR.Remediation Module' {
 
     BeforeAll {
-        # Ensure stub functions exist for all Graph cmdlets
+        # Ensure stub functions exist for all Graph and EXO cmdlets
         $graphStubs = @(
             'Get-MgUser', 'Update-MgUser', 'Revoke-MgUserSignInSession',
             'Get-MgUserAuthenticationMethod', 'Get-MgUserOauth2PermissionGrant',
             'Remove-MgOauth2PermissionGrant', 'Get-MgOauth2PermissionGrant',
-            'Get-MgUserMemberOf', 'Get-MgUserMailboxSetting',
-            'Invoke-MgGraphRequest', 'Get-MgUserMailFolder',
-            'Get-MgUserMailFolderMessageRule', 'Remove-MgUserMailFolderMessageRule'
+            'Get-MgUserMemberOf', 'Invoke-MgGraphRequest'
         )
-        foreach ($cmd in $graphStubs) {
+        $exoStubs = @(
+            'Get-MailboxPermission', 'Remove-MailboxPermission',
+            'Get-RecipientPermission', 'Remove-RecipientPermission',
+            'Get-MailboxFolderPermission', 'Remove-MailboxFolderPermission',
+            'Get-Mailbox', 'Set-Mailbox', 'Get-InboxRule', 'Remove-InboxRule',
+            'Get-MailboxJunkEmailConfiguration', 'Set-MailboxJunkEmailConfiguration',
+            'Get-App', 'Get-OrganizationConfig',
+            'Test-ACRExchangeOnlineConnected'
+        )
+        foreach ($cmd in ($graphStubs + $exoStubs)) {
             if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
                 Set-Item -Path "function:global:$cmd" -Value { }
             }
@@ -109,22 +116,21 @@ Describe 'ACR.Remediation Module' {
     Context 'Remove-ACRMailboxDelegates' {
 
         It 'Removes delegates and creates rollback entry' {
-            Mock Get-MgUserMailboxSetting -ModuleName ACR.Remediation { [PSCustomObject]@{} }
-            Mock Get-MgUser -ModuleName ACR.Remediation { [PSCustomObject]@{ Id = 'uid-1'; DisplayName = 'User' } }
-            Mock Get-MgUserOauth2PermissionGrant -ModuleName ACR.Remediation {
+            Mock Test-ACRExchangeOnlineConnected -ModuleName ACR.Remediation { return $true }
+            Mock Get-MailboxPermission -ModuleName ACR.Remediation {
                 @([PSCustomObject]@{
-                    Id          = 'grant-1'
-                    ClientId    = 'client-1'
-                    Scope       = 'Mail.ReadWrite'
-                    PrincipalId = 'pid-1'
+                    User         = 'delegate@contoso.com'
+                    AccessRights = @('FullAccess')
+                    IsInherited  = $false
                 })
             }
-            Mock Remove-MgOauth2PermissionGrant -ModuleName ACR.Remediation {}
+            Mock Get-RecipientPermission -ModuleName ACR.Remediation { return @() }
+            Mock Remove-MailboxPermission -ModuleName ACR.Remediation {}
 
             $result = Remove-ACRMailboxDelegates -UserPrincipalName 'user@contoso.com'
 
             $result.Status | Should -Be 'Success'
-            Should -Invoke Remove-MgOauth2PermissionGrant -ModuleName ACR.Remediation -Times 1
+            Should -Invoke Remove-MailboxPermission -ModuleName ACR.Remediation -Times 1
 
             # Verify rollback entry was created
             $session = Get-ACRLogSession
@@ -132,9 +138,9 @@ Describe 'ACR.Remediation Module' {
         }
 
         It 'Returns a result object with Status property' {
-            Mock Get-MgUserMailboxSetting -ModuleName ACR.Remediation { [PSCustomObject]@{} }
-            Mock Get-MgUser -ModuleName ACR.Remediation { [PSCustomObject]@{ Id = 'uid-1' } }
-            Mock Get-MgUserOauth2PermissionGrant -ModuleName ACR.Remediation { return @() }
+            Mock Test-ACRExchangeOnlineConnected -ModuleName ACR.Remediation { return $true }
+            Mock Get-MailboxPermission -ModuleName ACR.Remediation { return @() }
+            Mock Get-RecipientPermission -ModuleName ACR.Remediation { return @() }
 
             $result = Remove-ACRMailboxDelegates -UserPrincipalName 'user@contoso.com'
 
@@ -145,32 +151,35 @@ Describe 'ACR.Remediation Module' {
     Context 'Remove-ACREmailForwarding' {
 
         It 'Detects and removes forwarding rules' {
-            Mock Get-MgUser -ModuleName ACR.Remediation { [PSCustomObject]@{ Id = 'uid-1'; Mail = 'user@contoso.com'; OtherMails = @() } }
-            Mock Invoke-MgGraphRequest -ModuleName ACR.Remediation { return @{} }
-            Mock Get-MgUserMailFolder -ModuleName ACR.Remediation {
-                @([PSCustomObject]@{ Id = 'inbox-id'; DisplayName = 'Inbox' })
+            Mock Test-ACRExchangeOnlineConnected -ModuleName ACR.Remediation { return $true }
+            Mock Get-Mailbox -ModuleName ACR.Remediation {
+                [PSCustomObject]@{
+                    ForwardingSmtpAddress     = $null
+                    ForwardingAddress         = $null
+                    DeliverToMailboxAndForward = $false
+                }
             }
-            Mock Get-MgUserMailFolderMessageRule -ModuleName ACR.Remediation {
+            Mock Set-Mailbox -ModuleName ACR.Remediation {}
+            Mock Get-InboxRule -ModuleName ACR.Remediation {
                 @([PSCustomObject]@{
-                    Id          = 'rule-1'
-                    DisplayName = 'Fwd to ext'
-                    Actions     = [PSCustomObject]@{
-                        ForwardTo              = @([PSCustomObject]@{ EmailAddress = [PSCustomObject]@{ Address = 'ext@evil.com' } })
-                        ForwardAsAttachmentTo  = $null
-                        RedirectTo             = $null
-                    }
+                    Name                  = 'Fwd to ext'
+                    RuleIdentity          = 'rule-1'
+                    ForwardTo             = @('ext@evil.com')
+                    RedirectTo            = $null
+                    ForwardAsAttachmentTo = $null
                 })
             }
-            Mock Remove-MgUserMailFolderMessageRule -ModuleName ACR.Remediation {}
+            Mock Remove-InboxRule -ModuleName ACR.Remediation {}
 
             $result = Remove-ACREmailForwarding -UserPrincipalName 'user@contoso.com'
 
             $result.Status | Should -Be 'Success'
-            Should -Invoke Remove-MgUserMailFolderMessageRule -ModuleName ACR.Remediation -Times 1
+            Should -Invoke Remove-InboxRule -ModuleName ACR.Remediation -Times 1
         }
 
         It 'Handles errors without throwing' {
-            Mock Get-MgUser -ModuleName ACR.Remediation { throw 'User not found' }
+            Mock Test-ACRExchangeOnlineConnected -ModuleName ACR.Remediation { return $true }
+            Mock Get-Mailbox -ModuleName ACR.Remediation { throw 'Mailbox not found' }
 
             $result = Remove-ACREmailForwarding -UserPrincipalName 'missing@contoso.com'
 

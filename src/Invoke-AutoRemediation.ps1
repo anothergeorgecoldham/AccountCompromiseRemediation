@@ -46,6 +46,12 @@ param(
 
     [switch]$SkipForensics,
 
+    [Parameter()]
+    [switch]$SkipPreflight,
+
+    [Parameter()]
+    [switch]$DryRun,
+
     [int]$MaxRetries = 3,
 
     [int]$RetryDelaySeconds = 30
@@ -55,7 +61,7 @@ $ErrorActionPreference = 'Continue'
 
 # --- Module Import ---
 $modulesPath = Join-Path $PSScriptRoot 'modules'
-foreach ($mod in @('ACR.Auth', 'ACR.Logging', 'ACR.Forensics', 'ACR.Reporting', 'ACR.Remediation')) {
+foreach ($mod in @('ACR.Auth', 'ACR.Logging', 'ACR.Preflight', 'ACR.Forensics', 'ACR.Reporting', 'ACR.Remediation')) {
     Import-Module (Join-Path $modulesPath "$mod.psm1") -Force -ErrorAction Stop
 }
 
@@ -144,6 +150,35 @@ try {
     $exoConnected = Connect-ACRExchangeOnlineMI
     if (-not $exoConnected) {
         Write-Warning "Exchange Online not connected — mailbox and transport rule actions will be limited."
+    }
+
+    # --- Step 1b: Preflight Validation ---
+    $preflightSummary = $null
+    if (-not $SkipPreflight) {
+        Write-Verbose "Running preflight validation..."
+        $preflight = Invoke-ACRPreflight -UserPrincipalName $UserPrincipalName -SkipAuditCheck
+        $preflightSummary = @{
+            ready    = $preflight.Ready
+            passes   = $preflight.PassCount
+            warnings = $preflight.WarningCount
+            failures = $preflight.FailCount
+            checks   = @($preflight.Checks | ForEach-Object {
+                @{ name = $_.Name; status = $_.Status; message = $_.Message; blocking = $_.Blocking }
+            })
+        }
+
+        if (-not $preflight.Ready) {
+            $errorJson = @{
+                status            = 'Failed'
+                correlationId     = $CorrelationId
+                userPrincipalName = $UserPrincipalName
+                error             = "Preflight validation failed. Blocking issues: $(($preflight.BlockingFailures | ForEach-Object { $_.Name }) -join ', ')"
+                preflight         = $preflightSummary
+                timestamp         = (Get-Date -Format 'o')
+            } | ConvertTo-Json -Depth 8
+            Write-Output $errorJson
+            exit 2
+        }
     }
 
     # --- Step 2: User Context ---
@@ -259,22 +294,52 @@ try {
     }
 
     # --- Step 6: Execute Remediation Actions ---
-    Write-Verbose "Executing $($allActions.Count) remediation actions..."
-
-    foreach ($action in $allActions) {
-        try {
-            Invoke-WithRetry -ActionName $action.Name -ScriptBlock $action.Function
-            $successCount++
-            $actionResults.Add(@{ name = $action.Name; status = 'Success'; message = 'Completed successfully' })
-            Write-ACRAction -Action $action.Name -Status 'Success' -Message 'Completed successfully'
+    if ($DryRun) {
+        Write-Verbose "DRY RUN: skipping execution of $($allActions.Count) action(s)."
+        foreach ($action in $allActions) {
+            $actionResults.Add(@{ name = $action.Name; status = 'DryRun'; message = 'DryRun — not executed' })
+            Write-ACRAction -Action $action.Name -Status 'DryRun' -Message 'DryRun — not executed'
         }
-        catch {
-            $failedCount++
-            $errMsg = $_.Exception.Message
-            $actionResults.Add(@{ name = $action.Name; status = 'Failed'; message = $errMsg })
-            $errors.Add(@{ action = $action.Name; error = $errMsg })
-            Write-ACRAction -Action $action.Name -Status 'Failed' -Message $errMsg
-            Write-Warning "Action '$($action.Name)' failed: $errMsg"
+    } else {
+        Write-Verbose "Executing $($allActions.Count) remediation actions..."
+        foreach ($action in $allActions) {
+            try {
+                $actionResult = Invoke-WithRetry -ActionName $action.Name -ScriptBlock $action.Function
+                $successCount++
+                $actionResults.Add(@{ name = $action.Name; status = 'Success'; message = 'Completed successfully' })
+                Write-ACRAction -Action $action.Name -Status 'Success' -Message 'Completed successfully'
+
+                if ($action.Name -eq 'ResetPassword' -and $actionResult -and $actionResult.Details -and $actionResult.Details.NewPassword) {
+                    try {
+                        $credDir = Join-Path $OutputPath 'CREDENTIALS'
+                        if (-not (Test-Path $credDir)) { New-Item -ItemType Directory -Path $credDir -Force | Out-Null }
+                        $safeUpn = ($UserPrincipalName -replace '[^\w\.\-]', '_')
+                        $credFile = Join-Path $credDir ("password-{0}-{1}.txt" -f $safeUpn, $CorrelationId)
+                        $credBody = "ACR auto-remediation temporary password`r`nUser: $UserPrincipalName`r`nGenerated: $((Get-Date).ToUniversalTime().ToString('o'))`r`nCorrelationId: $CorrelationId`r`n`r`nNEW PASSWORD: $($actionResult.Details.NewPassword)`r`n`r`nDeliver to the user via a secure out-of-band channel. Delete this file after delivery."
+                        Set-Content -Path $credFile -Value $credBody -Encoding UTF8
+                        try {
+                            $acl = New-Object System.Security.AccessControl.FileSecurity
+                            $acl.SetAccessRuleProtection($true, $false)
+                            $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+                            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'Allow')))
+                            Set-Acl -Path $credFile -AclObject $acl
+                        } catch {
+                            Write-Warning "Could not harden ACL on credential file: $($_.Exception.Message)"
+                        }
+                        Write-Verbose "New password written to $credFile"
+                    } catch {
+                        Write-Warning "Failed to persist new password: $($_.Exception.Message)"
+                    }
+                }
+            }
+            catch {
+                $failedCount++
+                $errMsg = $_.Exception.Message
+                $actionResults.Add(@{ name = $action.Name; status = 'Failed'; message = $errMsg })
+                $errors.Add(@{ action = $action.Name; error = $errMsg })
+                Write-ACRAction -Action $action.Name -Status 'Failed' -Message $errMsg
+                Write-Warning "Action '$($action.Name)' failed: $errMsg"
+            }
         }
     }
 
@@ -340,6 +405,7 @@ finally {
         reportPath          = $reportPath
         actions             = @($actionResults)
         errors              = @($errors)
+        preflight           = $preflightSummary
     }
 
     Write-Output ($result | ConvertTo-Json -Depth 10)

@@ -52,6 +52,18 @@ param(
     [switch]$SkipForensics,
 
     [Parameter()]
+    [switch]$SkipPreflight,
+
+    [Parameter()]
+    [switch]$DryRun,
+
+    [Parameter()]
+    [int]$MaxRetries = 3,
+
+    [Parameter()]
+    [int]$RetryDelaySeconds = 10,
+
+    [Parameter()]
     [string[]]$Actions,
 
     [Parameter()]
@@ -60,7 +72,7 @@ param(
 
 # ── Module Import ────────────────────────────────────────────────────────────
 $modulesPath = Join-Path $PSScriptRoot 'modules'
-foreach ($mod in @('ACR.Auth', 'ACR.Logging', 'ACR.Forensics', 'ACR.Reporting', 'ACR.Remediation')) {
+foreach ($mod in @('ACR.Auth', 'ACR.Logging', 'ACR.Preflight', 'ACR.Forensics', 'ACR.Reporting', 'ACR.Remediation')) {
     Import-Module (Join-Path $modulesPath "$mod.psm1") -Force -ErrorAction Stop
 }
 
@@ -68,6 +80,42 @@ foreach ($mod in @('ACR.Auth', 'ACR.Logging', 'ACR.Forensics', 'ACR.Reporting', 
 $OutputPath = [System.IO.Path]::GetFullPath($OutputPath)
 if (-not (Test-Path $OutputPath)) {
     New-Item -Path $OutputPath -ItemType Directory -Force | Out-Null
+}
+
+# ── Helper: retry wrapper for throttled calls ────────────────────────────────
+function Invoke-ACRWithRetry {
+    param(
+        [Parameter(Mandatory)][string]$ActionName,
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [int]$MaxAttempts = $MaxRetries,
+        [int]$BaseDelay = $RetryDelaySeconds
+    )
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            return & $ScriptBlock
+        } catch {
+            $isThrottled = $false
+            $retryAfter = $null
+            $ex = $_.Exception
+            if ($ex.Response) {
+                $statusCode = [int]$ex.Response.StatusCode
+                if ($statusCode -eq 429 -or $statusCode -eq 503) {
+                    $isThrottled = $true
+                    $retryAfter = $ex.Response.Headers['Retry-After']
+                }
+            }
+            if (-not $isThrottled -and $_.ToString() -match '(429|Too Many Requests|503|Service Unavailable)') {
+                $isThrottled = $true
+            }
+            if ($isThrottled -and $attempt -lt $MaxAttempts) {
+                $delay = if ($retryAfter) { [int]$retryAfter } else { $BaseDelay * $attempt }
+                Write-Host " [throttled — retrying in ${delay}s]" -ForegroundColor DarkYellow -NoNewline
+                Start-Sleep -Seconds $delay
+                continue
+            }
+            throw
+        }
+    }
 }
 
 # ── Helper: display banner ───────────────────────────────────────────────────
@@ -146,6 +194,35 @@ try {
         Write-Host '  [!] Exchange Online not connected — some actions will be limited' -ForegroundColor Yellow
     }
 
+    # ── 1b. Preflight Validation ─────────────────────────────────────────────
+    if (-not $SkipPreflight) {
+        Show-SectionHeader 'Preflight Validation'
+        $preflight = Invoke-ACRPreflight -UserPrincipalName $UserPrincipalName -SkipAuditCheck
+        Write-Host (Format-ACRPreflightReport -PreflightResult $preflight)
+
+        if (-not $preflight.Ready) {
+            Write-Host ''
+            Write-Host '  [✗] Preflight validation FAILED. Blocking issues detected:' -ForegroundColor Red
+            foreach ($b in $preflight.BlockingFailures) {
+                Write-Host "      - $($b.Name): $($b.Message)" -ForegroundColor Red
+            }
+            Write-Host ''
+            Write-Host '  Resolve the above issues or re-run with -SkipPreflight to bypass (not recommended).' -ForegroundColor Yellow
+            return
+        }
+
+        if ($preflight.WarningCount -gt 0) {
+            Write-Host "  [!] $($preflight.WarningCount) preflight warning(s). Review output above before proceeding." -ForegroundColor Yellow
+            $confirm = Read-Host 'Proceed anyway? [y/N]'
+            if ($confirm -notmatch '^[Yy]') {
+                Write-Host '  Aborted by operator. No changes were made.' -ForegroundColor Yellow
+                return
+            }
+        }
+    } else {
+        Write-Host '  [–] Preflight validation skipped (-SkipPreflight)' -ForegroundColor DarkYellow
+    }
+
     # ── 2. User Context ──────────────────────────────────────────────────────
     Show-SectionHeader 'Retrieving User Context'
     $userContext = Get-ACRUserContext -UserPrincipalName $UserPrincipalName
@@ -194,7 +271,8 @@ try {
         }
 
         Write-Host '  Generating forensic HTML report...' -ForegroundColor Gray
-        $reportPath = New-ACRHtmlReport -ForensicData $forensicData -UserContext $userContext -OutputPath $OutputPath
+        $forensicReportFile = Join-Path $OutputPath ("forensic-report-{0:yyyyMMdd-HHmmss}.html" -f (Get-Date))
+        $reportPath = New-ACRHtmlReport -ForensicData $forensicData -UserContext $userContext -OutputPath $forensicReportFile
         Write-Host "  [✓] Report saved: $reportPath" -ForegroundColor Green
     } else {
         Write-Host ''
@@ -283,6 +361,17 @@ try {
     # ── 7. Execute Remediation ───────────────────────────────────────────────
     Show-SectionHeader 'Phase 2: Remediation Execution'
 
+    if ($DryRun) {
+        Write-Host '  [DRY RUN MODE] The following actions WOULD be executed, but will NOT run:' -ForegroundColor Magenta
+        foreach ($key in $selectedKeys) {
+            $def = $ActionDefinitions[$key]
+            Write-Host "    • $key — $($def.Label)" -ForegroundColor Magenta
+        }
+        Write-Host ''
+        Write-Host '  No changes made. Re-run without -DryRun to execute.' -ForegroundColor Magenta
+        return
+    }
+
     $results = [System.Collections.Generic.List[PSCustomObject]]::new()
     $total   = $selectedKeys.Count
     $current = 0
@@ -293,7 +382,7 @@ try {
         Write-Host "  [$current/$total] $($def.Label)..." -ForegroundColor White -NoNewline
 
         try {
-            $result = & $def.Block
+            $result = Invoke-ACRWithRetry -ActionName $key -ScriptBlock $def.Block
             $status = if ($result -and $result.Status) { $result.Status } else { 'Success' }
             $msg    = if ($result -and $result.Message) { $result.Message } else { 'Completed' }
 
@@ -313,6 +402,51 @@ try {
                 Status  = $status
                 Message = $msg
             })
+
+            if ($key -eq 'ResetPassword' -and $status -eq 'Success' -and $result.Details -and $result.Details.NewPassword) {
+                $newPw = $result.Details.NewPassword
+                $credDir = Join-Path $OutputPath 'CREDENTIALS'
+                if (-not (Test-Path $credDir)) { New-Item -ItemType Directory -Path $credDir -Force | Out-Null }
+                $safeUpn = ($UPN -replace '[^\w\.\-]', '_')
+                $credFile = Join-Path $credDir ("password-{0}-{1:yyyyMMdd-HHmmss}.txt" -f $safeUpn, (Get-Date))
+                $credBody = @"
+ACR — Temporary password for $UPN
+Generated : $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss UTC'))
+Operator  : $env:USERNAME
+Tenant    : $((Get-MgContext).TenantId)
+
+NEW PASSWORD: $newPw
+
+Notes:
+- The user MUST change this password on first sign-in (ForceChangePasswordNextSignIn = true).
+- Deliver this password to the user ONLY via a secure, out-of-band channel (e.g. verified phone call, in-person, Authenticated Secure Messaging). Do NOT email it to the account being remediated.
+- Delete this file once the password has been delivered.
+"@
+                Set-Content -Path $credFile -Value $credBody -Encoding UTF8
+                try {
+                    $acl = New-Object System.Security.AccessControl.FileSecurity
+                    $acl.SetAccessRuleProtection($true, $false)
+                    $me  = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+                    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                        $me, 'FullControl', 'Allow')
+                    $acl.AddAccessRule($rule)
+                    Set-Acl -Path $credFile -AclObject $acl
+                } catch {
+                    Write-Warning "Could not harden ACL on $credFile : $($_.Exception.Message). File exists but may be readable by other local admins."
+                }
+
+                Write-Host ''
+                Write-Host '  ┌──────────────────────────────────────────────────────────┐' -ForegroundColor Yellow
+                Write-Host '  │  NEW PASSWORD (shown ONCE — copy now and deliver securely) │' -ForegroundColor Yellow
+                Write-Host '  └──────────────────────────────────────────────────────────┘' -ForegroundColor Yellow
+                Write-Host ''
+                Write-Host "      $newPw" -ForegroundColor Cyan
+                Write-Host ''
+                Write-Host "  Also saved to: $credFile" -ForegroundColor Gray
+                Write-Host '  Deliver via a secure out-of-band channel (verified phone, in-person, etc).' -ForegroundColor DarkYellow
+                Write-Host '  Delete the credential file after delivery.' -ForegroundColor DarkYellow
+                Write-Host ''
+            }
         } catch {
             Write-Host ' Failed' -ForegroundColor Red
             Write-ACRAction -Action $key -Status 'Failed' -Message $_.Exception.Message -Target $UPN
@@ -353,19 +487,28 @@ try {
     # ── 9. Post-Remediation Report ───────────────────────────────────────────
     Show-SectionHeader 'Generating Post-Remediation Report'
 
-    $remediationSummary = [PSCustomObject]@{
-        Actions     = $results
-        TotalCount  = $results.Count
-        SuccessCount = $succeeded
-        FailedCount  = $failed
-        OtherCount   = $other
-        CompletedAt  = (Get-Date).ToUniversalTime()
+    $remediationSummary = @{}
+    foreach ($r in $results) {
+        $remediationSummary[$r.Action] = @{
+            Status    = $r.Status
+            Message   = $r.Message
+            Label     = $r.Label
+            Timestamp = (Get-Date).ToUniversalTime()
+        }
     }
 
+    $postReportFile = Join-Path $OutputPath ("remediation-report-{0:yyyyMMdd-HHmmss}.html" -f (Get-Date))
     $postReportPath = New-ACRHtmlReport -ForensicData $forensicData -UserContext $userContext `
-        -OutputPath $OutputPath -RemediationSummary $remediationSummary
+        -OutputPath $postReportFile -RemediationSummary $remediationSummary
     Write-Host "  [✓] Post-remediation report: $postReportPath" -ForegroundColor Green
 
+} catch {
+    Write-Host ''
+    Write-Host '  [✗] Remediation run encountered an error:' -ForegroundColor Red
+    Write-Host "      $($_.Exception.Message)" -ForegroundColor Red
+    if ($_.InvocationInfo -and $_.InvocationInfo.PositionMessage) {
+        Write-Host "      $($_.InvocationInfo.PositionMessage)" -ForegroundColor DarkGray
+    }
 } finally {
     # ── 10. Finalize ─────────────────────────────────────────────────────────
     Write-Host ''

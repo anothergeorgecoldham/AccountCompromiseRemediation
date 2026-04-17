@@ -9,17 +9,17 @@ This document describes each of the 20 remediation actions, including the PowerS
 | PowerShell Module | Install Command | Used By |
 |---|---|---|
 | **Microsoft.Graph.Authentication** | `Install-Module Microsoft.Graph.Authentication` | Auth (both modes) |
-| **Microsoft.Graph.Users** | `Install-Module Microsoft.Graph.Users` | Actions 1–3, 5–7, 11–12, 16–17, 18–19, 20 |
+| **Microsoft.Graph.Users** | `Install-Module Microsoft.Graph.Users` | Actions 1–3, 11–12, 16–17, 18–19, 20 |
 | **Microsoft.Graph.Users.Actions** | `Install-Module Microsoft.Graph.Users.Actions` | Action 2 (Revoke-MgUserSignInSession) |
-| **Microsoft.Graph.Identity.SignIns** | `Install-Module Microsoft.Graph.Identity.SignIns` | Actions 3–4, 12, 18 (OAuth2 grants) |
+| **Microsoft.Graph.Identity.SignIns** | `Install-Module Microsoft.Graph.Identity.SignIns` | Actions 3, 12, 18 (OAuth2 grants) |
 | **Microsoft.Graph.Reports** | `Install-Module Microsoft.Graph.Reports` | Forensics (sign-in & audit logs) |
-| **Microsoft.Graph.Mail** | `Install-Module Microsoft.Graph.Mail` | Actions 5–8, Forensics (mailbox) |
+| **Microsoft.Graph.Mail** | `Install-Module Microsoft.Graph.Mail` | Action 10 (calendar-related mail), Forensics (Graph-based mail lookups) |
+| **ExchangeOnlineManagement** (v2.0.3+) | `Install-Module ExchangeOnlineManagement` | Actions 5–9, 20, Forensics (mailbox audit, unified audit log) |
 | **Microsoft.Graph.Calendar** | `Install-Module Microsoft.Graph.Calendar` | Action 10 (calendar sharing) |
 | **Microsoft.Graph.Files** | `Install-Module Microsoft.Graph.Files` | Action 16 (SharePoint/OneDrive) |
 | **Microsoft.Graph.Groups** | `Install-Module Microsoft.Graph.Groups` | Action 17 (Teams guests) |
 | **Microsoft.Graph.Applications** | `Install-Module Microsoft.Graph.Applications` | Action 19 (app registration secrets) |
 | **Microsoft.Graph.DeviceManagement** | `Install-Module Microsoft.Graph.DeviceManagement` | Action 11 (mobile devices) |
-| **ExchangeOnlineManagement** (v2.0.3+) | `Install-Module ExchangeOnlineManagement` | Action 20, Forensics (unified audit log) |
 | **Microsoft.PowerApps.Administration.PowerShell** ⚠ | `Install-Module Microsoft.PowerApps.Administration.PowerShell` | Actions 13–15 (Power Platform) |
 
 > **⚠ PowerShell 7 Compatibility Note:** The `Microsoft.PowerApps.Administration.PowerShell` module only supports **Windows PowerShell 5.1** natively. When running on PowerShell 7+ on Windows, the scripts automatically use `Import-Module -UseWindowsPowerShell` to proxy calls through a WinPS 5.1 compatibility session. This means:
@@ -31,6 +31,8 @@ This document describes each of the 20 remediation actions, including the PowerS
 
 ## Authentication Differences
 
+### Microsoft Graph
+
 | Aspect | Interactive Script | Non-Interactive Script |
 |---|---|---|
 | **Function** | `Connect-ACRInteractive` | `Connect-ACRManagedIdentity` |
@@ -38,6 +40,19 @@ This document describes each of the 20 remediation actions, including the PowerS
 | **Flow** | Browser-based delegated auth | Azure Managed Identity (no user interaction) |
 | **Permissions** | Delegated permissions | Application permissions |
 | **Retry logic** | None (operator present) | Exponential backoff on HTTP 429/503 |
+
+### Exchange Online
+
+| Aspect | Interactive Script | Non-Interactive Script |
+|---|---|---|
+| **Function** | `Connect-ACRExchangeOnline` | `Connect-ACRExchangeOnlineMI` |
+| **Cmdlet** | `Connect-ExchangeOnline` (interactive) | `Connect-ExchangeOnline -ManagedIdentity -Organization <tenant>` |
+| **Flow** | Browser-based delegated auth | Azure Managed Identity (no user interaction) |
+| **Used By** | Actions 5–9, 20, Forensics (mailbox audit, unified audit log) | Same |
+| **Connection Check** | `Test-ACRExchangeOnlineConnected` — returns `$true`/`$false` | Same |
+| **Disconnect** | `Disconnect-ACR` disconnects both Graph and EXO | Same |
+
+> **Note:** All EXO-dependent operations gracefully skip with a warning if Exchange Online is not connected. `Test-ACRExchangeOnlineConnected` is checked before each EXO operation.
 
 ---
 
@@ -90,12 +105,13 @@ This document describes each of the 20 remediation actions, including the PowerS
 | Aspect | Detail |
 |---|---|
 | **Function** | `Remove-ACRAppPasswords` |
-| **Graph Module** | `Microsoft.Graph.Identity.SignIns` |
-| **Key Cmdlets** | `Get-MgUserAuthenticationMethod -UserId <UPN>`, `Remove-MgUserAuthenticationMethod -UserId <UPN> -AuthenticationMethodId <ID>` |
-| **What it does** | Enumerates all authentication methods, identifies app password types (used for legacy authentication with per-user MFA), and removes them |
-| **Interactive** | Operator selects from menu; shown count of removed app passwords |
-| **Non-Interactive** | Runs automatically; count included in JSON output |
-| **Rollback** | Logs the authentication method IDs that were removed. User can create new app passwords if needed via https://mysignins.microsoft.com |
+| **Graph Module** | `Microsoft.Graph.Authentication` (via `Invoke-MgGraphRequest`) |
+| **Key Cmdlets** | `Invoke-MgGraphRequest -Method GET /users/<UPN>/authentication/methods` |
+| **What it does** | Queries the `/authentication/methods` endpoint to enumerate authentication methods, identifies app password types, and flags them for manual review. App passwords cannot be directly removed via Graph API |
+| **Interactive** | Operator selects from menu; shown list of app passwords found with manual removal guidance |
+| **Non-Interactive** | Runs automatically; flags app passwords for manual review in JSON output |
+| **Rollback** | Read-only detection — no automatic removal. User can manage app passwords via https://mysignins.microsoft.com |
+| **⚠ Note** | App passwords cannot be programmatically removed via Graph; manual review is required |
 
 ---
 
@@ -104,12 +120,13 @@ This document describes each of the 20 remediation actions, including the PowerS
 | Aspect | Detail |
 |---|---|
 | **Function** | `Remove-ACRMailboxDelegates` |
-| **Graph Module** | `Microsoft.Graph.Mail` / `Microsoft.Graph.Identity.SignIns` |
-| **Key Cmdlets** | `Get-MgUser -UserId <UPN>`, `Get-MgUserOauth2PermissionGrant -UserId <UPN> -All`, `Remove-MgOauth2PermissionGrant -OAuth2PermissionGrantId <ID>` |
-| **What it does** | Identifies mailbox delegate permission grants (OAuth2 grants scoped to mail) and removes them |
+| **Required Module** | `ExchangeOnlineManagement` |
+| **Key Cmdlets** | `Get-MailboxPermission -Identity <UPN>`, `Remove-MailboxPermission -Identity <UPN> -User <Delegate> -AccessRights FullAccess`, `Get-RecipientPermission -Identity <UPN>`, `Remove-RecipientPermission -Identity <UPN> -Trustee <Delegate> -AccessRights SendAs` |
+| **What it does** | Retrieves mailbox delegate permissions (FullAccess, SendAs, SendOnBehalf) via EXO cmdlets and removes non-default entries |
 | **Interactive** | Displays delegate list before removal; operator confirms via menu selection |
 | **Non-Interactive** | Removes all identified delegates automatically |
-| **Rollback** | Logs delegate email addresses and permission scopes. Re-add via `New-MgOauth2PermissionGrant` or Exchange Admin Center |
+| **Rollback** | Logs delegate email addresses and permission types. Re-add via `Add-MailboxPermission` / `Add-RecipientPermission` or Exchange Admin Center |
+| **⚠ Note** | Requires Exchange Online connection (`Test-ACRExchangeOnlineConnected`). Skips with warning if not connected |
 
 ---
 
@@ -118,12 +135,13 @@ This document describes each of the 20 remediation actions, including the PowerS
 | Aspect | Detail |
 |---|---|
 | **Function** | `Remove-ACRMailboxFolderPermissions` |
-| **Graph Module** | `Microsoft.Graph.Mail` |
-| **Key Cmdlets** | `Get-MgUserMailFolder -UserId <UPN> -All`, `Invoke-MgGraphRequest -Method GET /users/<UPN>/mailFolders/<ID>/permissions`, `Invoke-MgGraphRequest -Method DELETE .../permissions/<ID>` |
-| **What it does** | Iterates through all mail folders, identifies non-default permissions (where a specific user/group was granted access), and removes them |
+| **Required Module** | `ExchangeOnlineManagement` |
+| **Key Cmdlets** | `Get-MailboxFolderPermission -Identity <UPN>:\<FolderPath>`, `Remove-MailboxFolderPermission -Identity <UPN>:\<FolderPath> -User <User>` |
+| **What it does** | Iterates through mailbox folders, identifies non-default permissions (where a specific user/group was granted access), and removes them using EXO cmdlets |
 | **Interactive** | Operator selects from menu; shown count of removed permissions per folder |
 | **Non-Interactive** | Runs automatically; details included in JSON output |
 | **Rollback** | Logs folder name, granted user, and permission level for each removed permission |
+| **⚠ Note** | Requires Exchange Online connection (`Test-ACRExchangeOnlineConnected`). Skips with warning if not connected |
 
 ---
 
@@ -132,12 +150,13 @@ This document describes each of the 20 remediation actions, including the PowerS
 | Aspect | Detail |
 |---|---|
 | **Function** | `Remove-ACREmailForwarding` |
-| **Graph Module** | `Microsoft.Graph.Users` / `Microsoft.Graph.Mail` |
-| **Key Cmdlets** | `Get-MgUser -UserId <UPN>`, `Invoke-MgGraphRequest -Method GET /users/<UPN>/mailboxSettings`, `Get-MgUserMailFolder -UserId <UPN>`, `Get-MgUserMailFolderMessageRule -UserId <UPN> -MailFolderId Inbox`, `Remove-MgUserMailFolderMessageRule` |
-| **What it does** | Checks two forwarding vectors: (1) SMTP forwarding address in mailbox settings, (2) Inbox rules that forward or redirect mail. Removes offending rules |
+| **Required Module** | `ExchangeOnlineManagement` |
+| **Key Cmdlets** | `Get-Mailbox -Identity <UPN>` (checks ForwardingSmtpAddress/ForwardingAddress), `Set-Mailbox -Identity <UPN> -ForwardingSmtpAddress $null -ForwardingAddress $null`, `Get-InboxRule -Mailbox <UPN>`, `Remove-InboxRule -Identity <RuleID> -Mailbox <UPN>` |
+| **What it does** | Checks two forwarding vectors: (1) SMTP forwarding address via `Get-Mailbox`, clears with `Set-Mailbox`; (2) Inbox rules that forward or redirect mail via `Get-InboxRule`, removes offending rules with `Remove-InboxRule` |
 | **Interactive** | Displays forwarding addresses and rule names before removal |
 | **Non-Interactive** | Removes all forwarding rules automatically |
-| **Rollback** | Logs forwarding address and full rule definitions. Re-create via `New-MgUserMailFolderMessageRule` |
+| **Rollback** | Logs forwarding address and full rule definitions. Re-create via `New-InboxRule` or Exchange Admin Center |
+| **⚠ Note** | Requires Exchange Online connection (`Test-ACRExchangeOnlineConnected`). Skips with warning if not connected |
 
 ---
 
@@ -146,12 +165,13 @@ This document describes each of the 20 remediation actions, including the PowerS
 | Aspect | Detail |
 |---|---|
 | **Function** | `Remove-ACROutlookAddins` |
-| **Graph Module** | `Microsoft.Graph.Mail` (via direct Graph requests) |
-| **Key Cmdlets** | `Invoke-MgGraphRequest -Method GET /users/<UPN>/extensions` or add-in endpoints, `Invoke-MgGraphRequest -Method DELETE .../extensions/<ID>` |
-| **What it does** | Queries user-installed (sideloaded) Outlook add-ins and removes those not managed by the organization |
-| **Interactive** | Displays add-in names and IDs before removal |
-| **Non-Interactive** | Removes all sideloaded add-ins automatically |
-| **Rollback** | Logs add-in name and ID. Reinstall from Office Add-ins store if legitimate |
+| **Required Module** | `ExchangeOnlineManagement` (optional) |
+| **Key Cmdlets** | `Get-App -Mailbox <UPN>` (EXO, optional check) |
+| **What it does** | Checks for user-installed Outlook add-ins using `Get-App` from EXO if available. Flags findings for manual review. No longer uses Graph `/extensions` API |
+| **Interactive** | Displays add-in names if found; recommends manual review in Exchange Admin Center |
+| **Non-Interactive** | Logs findings and flags for manual review in JSON output |
+| **Rollback** | Read-only check — manual review recommended. Reinstall from Office Add-ins store if legitimate |
+| **⚠ Note** | Manual review recommended. Uses EXO `Get-App` for detection only; removal should be performed via Exchange Admin Center or by the user |
 
 ---
 
@@ -160,14 +180,13 @@ This document describes each of the 20 remediation actions, including the PowerS
 | Aspect | Detail |
 |---|---|
 | **Function** | `Remove-ACRSafeSenders` |
-| **Graph Module** | `Microsoft.Graph.Mail` (via direct Graph requests) |
-| **Key Cmdlets** | `Invoke-MgGraphRequest -Method GET /users/<UPN>/mailFolders/junkemail/...` |
-| **Fallback** | `Get-MailboxJunkEmailConfiguration -Identity <UPN>` (ExchangeOnlineManagement) |
-| **What it does** | Attempts to retrieve the Safe Senders list via Graph API. If direct API access is unavailable, logs guidance for manual review via Exchange Online PowerShell |
-| **Interactive** | Displays Safe Senders list for operator review with manual removal guidance |
-| **Non-Interactive** | Logs the list contents and flags for manual follow-up |
-| **Rollback** | Logs the Safe Senders list contents before any changes |
-| **⚠ Note** | Full Safe Senders management may require Exchange Online PowerShell; Graph API support is limited |
+| **Required Module** | `ExchangeOnlineManagement` |
+| **Key Cmdlets** | `Get-MailboxJunkEmailConfiguration -Identity <UPN>`, `Set-MailboxJunkEmailConfiguration -Identity <UPN> -TrustedSendersAndDomains @{Remove=<entries>}` |
+| **What it does** | Retrieves the Safe Senders list via EXO `Get-MailboxJunkEmailConfiguration`, identifies unknown/suspicious entries, and removes them using `Set-MailboxJunkEmailConfiguration` |
+| **Interactive** | Displays Safe Senders list for operator review; operator confirms removal |
+| **Non-Interactive** | Removes identified suspicious entries automatically; details in JSON output |
+| **Rollback** | Logs the Safe Senders list contents before any changes. Re-add via `Set-MailboxJunkEmailConfiguration -TrustedSendersAndDomains @{Add=<entries>}` |
+| **⚠ Note** | Requires Exchange Online connection (`Test-ACRExchangeOnlineConnected`). Skips with warning if not connected |
 
 ---
 
@@ -307,8 +326,8 @@ This document describes each of the 20 remediation actions, including the PowerS
 |---|---|
 | **Function** | `Remove-ACRAppRegistrationSecrets` |
 | **Graph Module** | `Microsoft.Graph.Applications` / `Microsoft.Graph.Users` |
-| **Key Cmdlets** | `Get-MgUserMemberOf -UserId <ID> -All`, `Get-MgUserOwnedObject -UserId <ID> -All`, `Get-MgApplication -ApplicationId <AppID>`, `Remove-MgApplicationPassword -ApplicationId <AppID> -BodyParameter @{KeyId=<KeyID>}` |
-| **What it does** | First verifies the user holds an admin role. Then retrieves app registrations owned by the user, identifies client secrets added within the lookback window (7 days), and removes them |
+| **Key Cmdlets** | `Get-MgUserMemberOf -UserId <ID> -All`, `Get-MgUserOwnedObject -UserId <ID> -All`, `Get-MgApplication -Property 'Id,DisplayName,PasswordCredentials,AppId'`, `Remove-MgApplicationPassword -ApplicationId <AppID> -BodyParameter @{KeyId=<KeyID>}` |
+| **What it does** | First verifies the user holds an admin role. Then retrieves app registrations owned by the user (using `-Property` to ensure `PasswordCredentials` are returned), identifies client secrets added within the lookback window (7 days), and removes them |
 | **Interactive** | Only shown in menu if user is detected as admin. Displays app names and secret metadata |
 | **Non-Interactive** | Runs only if admin roles detected; otherwise skipped |
 | **Rollback** | Logs app ID, app display name, and secret key ID (never logs the secret value). Applications using the removed secret will need a new one created |
@@ -335,28 +354,28 @@ This document describes each of the 20 remediation actions, including the PowerS
 
 ## Interactive vs Non-Interactive Behaviour Summary
 
-| # | Action | Automated via Graph? | Interactive Behaviour | Non-Interactive Behaviour |
-|---|--------|---------------------|----------------------|--------------------------|
-| 1 | Reset Password | ✅ Yes | Menu select; shows confirmation | Auto-runs; JSON result |
-| 2 | Revoke Tokens | ✅ Yes | Menu select; shows confirmation | Auto-runs; JSON result |
-| 3 | Enforce MFA | ✅ Check only | Displays MFA status to operator | Logs status; flags if exempted |
-| 4 | Remove App Passwords | ✅ Yes | Menu select; shows count removed | Auto-runs; JSON result |
-| 5 | Remove Mailbox Delegates | ✅ Yes | Menu select; shows delegate list | Auto-runs; JSON result |
-| 6 | Remove Folder Permissions | ✅ Yes | Menu select; shows permissions | Auto-runs; JSON result |
-| 7 | Remove Email Forwarding | ✅ Yes | Menu select; shows rules | Auto-runs; JSON result |
-| 8 | Remove Outlook Add-ins | ✅ Yes | Menu select; shows add-in list | Auto-runs; JSON result |
-| 9 | Remove Safe Senders | ⚠ Partial | Displays list; manual guidance | Logs Warning; manual follow-up |
-| 10 | Remove Calendar Sharing | ✅ Yes | Menu select; shows shared-with | Auto-runs; JSON result |
-| 11 | Remove Mobile Devices | ✅ Yes | Menu select; shows device list | Auto-runs; JSON result |
-| 12 | Remove User Consent Apps | ✅ Yes | Menu select; shows app list | Auto-runs; JSON result |
-| 13 | Remove Power Automate | ✅ Yes (with PP module) | Menu select; shows removed flows | Auto-runs; JSON result (Warning if module missing) |
-| 14 | Remove Power Apps | ✅ Yes (with PP module) | Menu select; shows removed apps | Auto-runs; JSON result (Warning if module missing) |
-| 15 | Remove Power Apps Sharing | ✅ Yes (with PP module) | Menu select; shows removed shares | Auto-runs; JSON result (Warning if module missing) |
-| 16 | Remove SP/OD Sharing Links | ✅ Yes | Menu select; shows shared items | Auto-runs; JSON result |
-| 17 | Remove Teams Guests | ✅ Yes | Menu select; shows guest list | Auto-runs; JSON result |
-| 18 | Remove Admin Consent Apps | ✅ Yes (admin only) | Shown only for admins | Runs if admin; skips otherwise |
-| 19 | Remove App Reg Secrets | ✅ Yes (admin only) | Shown only for admins | Runs if admin; skips otherwise |
-| 20 | Remove Exchange Rules | ⚠ Requires EXO module | Shown only for Exchange admins | Runs if EXO module + role; else Warning |
+| # | Action | Automated? | API/Module | Interactive Behaviour | Non-Interactive Behaviour |
+|---|--------|-----------|------------|----------------------|--------------------------|
+| 1 | Reset Password | ✅ Yes | Graph | Menu select; shows confirmation | Auto-runs; JSON result |
+| 2 | Revoke Tokens | ✅ Yes | Graph | Menu select; shows confirmation | Auto-runs; JSON result |
+| 3 | Enforce MFA | ✅ Check only | Graph | Displays MFA status to operator | Logs status; flags if exempted |
+| 4 | Remove App Passwords | ⚠ Detect only | Graph (`Invoke-MgGraphRequest`) | Shows app passwords; manual removal guidance | Flags for manual review in JSON |
+| 5 | Remove Mailbox Delegates | ✅ Yes | **EXO** (`Get/Remove-MailboxPermission`, `Get/Remove-RecipientPermission`) | Menu select; shows delegate list | Auto-runs; JSON result |
+| 6 | Remove Folder Permissions | ✅ Yes | **EXO** (`Get/Remove-MailboxFolderPermission`) | Menu select; shows permissions | Auto-runs; JSON result |
+| 7 | Remove Email Forwarding | ✅ Yes | **EXO** (`Get/Set-Mailbox`, `Get/Remove-InboxRule`) | Menu select; shows rules | Auto-runs; JSON result |
+| 8 | Remove Outlook Add-ins | ⚠ Detect only | **EXO** (`Get-App`, optional) | Shows add-in list; manual review | Flags for manual review in JSON |
+| 9 | Remove Safe Senders | ✅ Yes | **EXO** (`Get/Set-MailboxJunkEmailConfiguration`) | Menu select; shows safe senders | Auto-runs; JSON result |
+| 10 | Remove Calendar Sharing | ✅ Yes | Graph | Menu select; shows shared-with | Auto-runs; JSON result |
+| 11 | Remove Mobile Devices | ✅ Yes | Graph | Menu select; shows device list | Auto-runs; JSON result |
+| 12 | Remove User Consent Apps | ✅ Yes | Graph | Menu select; shows app list | Auto-runs; JSON result |
+| 13 | Remove Power Automate | ✅ Yes (with PP module) | Power Platform | Menu select; shows removed flows | Auto-runs; JSON result (Warning if module missing) |
+| 14 | Remove Power Apps | ✅ Yes (with PP module) | Power Platform | Menu select; shows removed apps | Auto-runs; JSON result (Warning if module missing) |
+| 15 | Remove Power Apps Sharing | ✅ Yes (with PP module) | Power Platform | Menu select; shows removed shares | Auto-runs; JSON result (Warning if module missing) |
+| 16 | Remove SP/OD Sharing Links | ✅ Yes | Graph | Menu select; shows shared items | Auto-runs; JSON result |
+| 17 | Remove Teams Guests | ✅ Yes | Graph | Menu select; shows guest list | Auto-runs; JSON result |
+| 18 | Remove Admin Consent Apps | ✅ Yes (admin only) | Graph | Shown only for admins | Runs if admin; skips otherwise |
+| 19 | Remove App Reg Secrets | ✅ Yes (admin only) | Graph | Shown only for admins | Runs if admin; skips otherwise |
+| 20 | Remove Exchange Rules | ⚠ Requires EXO module | **EXO** | Shown only for Exchange admins | Runs if EXO module + role; else Warning |
 
 ---
 
@@ -368,7 +387,9 @@ The forensic investigation phase (runs before remediation) uses these modules:
 |---|---|---|
 | Sign-in logs | `Microsoft.Graph.Reports` | `Get-MgAuditLogSignIn -Filter "..." -All` |
 | Directory audit logs | `Microsoft.Graph.Reports` | `Get-MgAuditLogDirectoryAudit -Filter "..." -All` |
-| Mailbox settings & delegates | `Microsoft.Graph.Mail` / `Microsoft.Graph.Users` | `Get-MgUserMailboxSetting`, `Get-MgUser` |
-| Mailbox folder permissions | `Microsoft.Graph.Mail` | `Get-MgUserMailFolder`, `Get-MgUserMailFolderPermission` |
-| Inbox rules | `Microsoft.Graph.Mail` | `Get-MgUserMailFolderMessageRule` |
+| Mailbox settings & delegates | `ExchangeOnlineManagement` | `Get-Mailbox -Identity <UPN>`, `Get-MailboxPermission -Identity <UPN>` |
+| Mailbox folder permissions | `ExchangeOnlineManagement` | `Get-MailboxFolderPermission -Identity <UPN>:\<FolderPath>` |
+| Inbox rules | `ExchangeOnlineManagement` | `Get-InboxRule -Mailbox <UPN>` |
 | Unified audit log (SP, OD, Teams, Power Platform) | `ExchangeOnlineManagement` | `Search-UnifiedAuditLog` |
+
+> **Note:** All EXO-based forensic operations check `Test-ACRExchangeOnlineConnected` before executing. If Exchange Online is not connected, the operation is gracefully skipped with a warning rather than failing.

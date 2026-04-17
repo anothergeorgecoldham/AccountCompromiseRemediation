@@ -155,7 +155,7 @@ function Reset-ACRPassword {
 
         return New-ACRResult -Status 'Success' `
             -Message "Password reset successfully. Change required at next login." `
-            -Details @{ ForceChange = $true }
+            -Details @{ ForceChange = $true; NewPassword = $newPassword }
     }
     catch {
         Write-ACRAction -Action $action -Status 'Failed' `
