@@ -7,6 +7,10 @@ CREDENTIALS/
 **/CREDENTIALS/
 **/password-*.txt
 
+# App-auth tenant configuration — contains TenantId/ClientId for the customer tenant.
+# The example template (config/app-auth.json.example) IS committed.
+config/app-auth.json
+
 # Local settings / editor
 .vscode/
 .idea/

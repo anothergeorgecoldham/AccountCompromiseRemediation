@@ -34,6 +34,31 @@
       "DeviceManagementManagedDevices.ReadWrite.All"
     ]
   },
+  "applicationPermissionsAppAuth": {
+    "description": "Used by Invoke-AccountRemediationAppAuth.ps1 (low-privilege analyst mode, certificate auth). Setup-ACRAppRegistration.ps1 grants admin consent for these.",
+    "graphAppRoles": [
+      { "name": "User.ReadWrite.All",                       "id": "741f803b-c850-494e-b5df-cde7c675a1ca", "purpose": "Reset password, revoke sessions, read user profile" },
+      { "name": "User-PasswordProfile.ReadWrite.All",       "id": "56760768-b641-451f-8906-e1b8ab31bca7", "purpose": "Reset password (specific scope; required for users without admin roles assigned to the app SP)" },
+      { "name": "Directory.Read.All",                       "id": "7ab1d382-f21e-4acd-a863-ba3e13f7da61", "purpose": "Read directory roles, group membership for context detection" },
+      { "name": "AuditLog.Read.All",                        "id": "b0afded3-3588-46d8-8b3d-9842eff778da", "purpose": "Forensic sign-in and audit log collection" },
+      { "name": "MailboxSettings.ReadWrite",                "id": "6931bccd-447a-43d1-b442-00a195474933", "purpose": "Read/clear mailbox settings (forwarding, automatic replies)" },
+      { "name": "Mail.ReadWrite",                           "id": "e2a3a72e-5f79-4c64-b1b1-878b674786c9", "purpose": "Inspect mail/inbox rules surface where Graph supports it" },
+      { "name": "Calendars.ReadWrite",                      "id": "ef54d2bf-783f-4e0f-bca1-3210c0444d99", "purpose": "Remove external calendar sharing/permissions" },
+      { "name": "Files.ReadWrite.All",                      "id": "75359482-378d-4052-8f06-c3cdc6f2a3ce", "purpose": "Remove SharePoint/OneDrive sharing links on user-owned items" },
+      { "name": "Sites.ReadWrite.All",                      "id": "9492366f-7969-46a4-8d15-ed1a20078fff", "purpose": "Site-level access required for OneDrive permission removal" },
+      { "name": "UserAuthenticationMethod.ReadWrite.All",   "id": "50483e42-d915-4231-9639-7fdb7fd190e5", "purpose": "Inspect/manage authentication methods (MFA enforcement)" },
+      { "name": "DelegatedPermissionGrant.ReadWrite.All",   "id": "8e8e4742-1d95-4f68-9d56-6ee75648c72a", "purpose": "Remove user-consented and admin-consented OAuth2 grants" },
+      { "name": "Application.ReadWrite.All",                "id": "1bfefb4e-e0b5-418b-a88f-73c46d2cc8e9", "purpose": "Remove client secrets from app registrations the user owns" },
+      { "name": "GroupMember.ReadWrite.All",                "id": "dbaae8cf-10b5-4b86-a4a1-f871c94c6695", "purpose": "Remove guest members from groups/teams the user owns" },
+      { "name": "DeviceManagementManagedDevices.ReadWrite.All", "id": "243333ab-4d21-40cb-a475-36241daa0842", "purpose": "Remove unknown synced mobile devices (Intune)" },
+      { "name": "RoleManagement.Read.Directory",            "id": "483bed4a-2ad3-4361-a73b-c83ccdbdc53c", "purpose": "Read directory role assignments to determine admin context" }
+    ],
+    "_notes": [
+      "All IDs above are Microsoft Graph application appRoleIds (resource appId 00000003-0000-0000-c000-000000000000). They are stable, public, and identical across tenants.",
+      "Reset of users in privileged roles requires the app's service principal to be assigned the 'Privileged Authentication Administrator' directory role (handled by Setup-ACRAppRegistration.ps1).",
+      "Power Platform actions (RemovePowerAutomateFlows, RemovePowerApps, RemovePowerAppsSharing) use a separate auth path (Add-PowerAppsAccount). The setup helper documents the manual SP registration step required there; if not configured, those actions return Skipped with manual guidance — same behavior as today when the module is missing."
+    ]
+  },
   "exchangeOnline": {
     "description": "Exchange Online PowerShell permissions required for mailbox and transport rule operations",
     "roles": [
@@ -41,7 +66,14 @@
       "Transport Rules",
       "Journaling",
       "Organization Management"
-    ]
+    ],
+    "appOnly": {
+      "description": "For Invoke-AccountRemediationAppAuth.ps1 the EXO service principal needs to be added to role groups. Setup-ACRAppRegistration.ps1 prints the required commands; assignment must be performed by an Exchange admin.",
+      "directoryRolesForServicePrincipal": [
+        { "name": "Exchange Administrator", "templateId": "29232cdf-9323-42fd-ade2-1d097af3e4de", "purpose": "Mailbox, transport, journal, inbox-rule actions" },
+        { "name": "Privileged Authentication Administrator", "templateId": "7be44c8a-adaf-4e2a-84d6-ab2649e08a13", "purpose": "Optional: required only if you must reset passwords for users in privileged roles" }
+      ]
+    }
   },
   "powerPlatform": {
     "description": "Power Platform admin permissions required for Power Automate and Power Apps remediation",

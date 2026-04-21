@@ -1,0 +1,12 @@
+{
+  "_comment": [
+    "Configuration for Invoke-AccountRemediationAppAuth.ps1 (app-only certificate auth).",
+    "Copy this file to 'app-auth.json' (same directory) and fill in the values produced by Setup-ACRAppRegistration.ps1.",
+    "config/app-auth.json is gitignored. Do NOT commit your tenant's real values.",
+    "Any field can be overridden at runtime by passing the matching script parameter."
+  ],
+  "tenantId": "00000000-0000-0000-0000-000000000000",
+  "clientId": "00000000-0000-0000-0000-000000000000",
+  "certificateThumbprint": "0000000000000000000000000000000000000000",
+  "organization": "contoso.onmicrosoft.com"
+}

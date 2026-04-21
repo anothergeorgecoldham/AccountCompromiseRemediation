@@ -339,11 +339,236 @@ function Test-ACRExchangeOnlineConnected {
     }
 }
 
+function Connect-ACRAppAuth {
+    <#
+    .SYNOPSIS
+        Connects to Microsoft Graph using a certificate (app-only auth).
+    .DESCRIPTION
+        Authenticates as the configured app registration using a certificate held in
+        the local Windows certificate store (Cert:\CurrentUser\My or
+        Cert:\LocalMachine\My) or supplied as a file. The script then runs with
+        the application permissions granted to the app registration, regardless of
+        the operator's own Entra roles. This enables low-privilege analysts to
+        execute the full remediation workflow.
+    .PARAMETER TenantId
+        Target tenant GUID or domain (required).
+    .PARAMETER ClientId
+        App registration's Application (client) ID (required).
+    .PARAMETER CertificateThumbprint
+        Thumbprint of the certificate in Cert:\CurrentUser\My or Cert:\LocalMachine\My.
+        Either CertificateThumbprint or CertificatePath must be supplied.
+    .PARAMETER CertificatePath
+        Optional path to a .pfx/.cer file. If a .pfx is used a password may be
+        required (passed via -CertificatePassword as a SecureString).
+    .PARAMETER CertificatePassword
+        Optional SecureString password for a .pfx file.
+    .OUTPUTS
+        The Microsoft Graph authentication context.
+    .EXAMPLE
+        Connect-ACRAppAuth -TenantId 'contoso.onmicrosoft.com' -ClientId '<guid>' -CertificateThumbprint '<thumbprint>'
+    #>
+    [CmdletBinding(DefaultParameterSetName = 'Thumbprint')]
+    param(
+        [Parameter(Mandatory)][string]$TenantId,
+        [Parameter(Mandatory)][string]$ClientId,
+
+        [Parameter(Mandatory, ParameterSetName = 'Thumbprint')]
+        [string]$CertificateThumbprint,
+
+        [Parameter(Mandatory, ParameterSetName = 'Path')]
+        [string]$CertificatePath,
+
+        [Parameter(ParameterSetName = 'Path')]
+        [System.Security.SecureString]$CertificatePassword
+    )
+
+    $cert = $null
+
+    if ($PSCmdlet.ParameterSetName -eq 'Thumbprint') {
+        $thumb = $CertificateThumbprint -replace '\s',''
+        foreach ($store in @('Cert:\CurrentUser\My','Cert:\LocalMachine\My')) {
+            try {
+                $found = Get-ChildItem $store -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Thumbprint -eq $thumb } | Select-Object -First 1
+                if ($found) { $cert = $found; break }
+            } catch { }
+        }
+        if (-not $cert) {
+            throw "Certificate with thumbprint '$thumb' not found in CurrentUser\My or LocalMachine\My. Run Setup-ACRAppRegistration.ps1 to provision one, or import the cert and try again."
+        }
+        if ($cert.NotAfter -lt (Get-Date)) {
+            throw "Certificate '$thumb' expired on $($cert.NotAfter.ToString('o'))."
+        }
+        if (-not $cert.HasPrivateKey) {
+            throw "Certificate '$thumb' does not have an accessible private key in this user's context."
+        }
+    }
+    else {
+        if (-not (Test-Path $CertificatePath)) {
+            throw "Certificate file not found: $CertificatePath"
+        }
+        try {
+            if ($CertificatePassword) {
+                $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertificatePath, $CertificatePassword)
+            } else {
+                $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertificatePath)
+            }
+        } catch {
+            throw "Failed to load certificate from '$CertificatePath': $($_.Exception.Message)"
+        }
+    }
+
+    try {
+        Write-Verbose "Connecting to Microsoft Graph (app-only) — TenantId=$TenantId ClientId=$ClientId Thumbprint=$($cert.Thumbprint)"
+        $context = Connect-MgGraph -TenantId $TenantId -ClientId $ClientId -Certificate $cert -NoWelcome -ErrorAction Stop
+    } catch {
+        throw "Failed to connect to Microsoft Graph with certificate auth: $($_.Exception.Message)"
+    }
+
+    $script:ACRAppAuthContext = [PSCustomObject]@{
+        TenantId              = $TenantId
+        ClientId              = $ClientId
+        CertificateThumbprint = $cert.Thumbprint
+        CertificateExpiry     = $cert.NotAfter
+        AuthMode              = 'AppOnly'
+    }
+
+    Write-Verbose "Connected. Auth mode = AppOnly. Cert expires $($cert.NotAfter.ToString('o'))."
+    return $context
+}
+
+function Connect-ACRExchangeOnlineApp {
+    <#
+    .SYNOPSIS
+        Connects to Exchange Online using app-only certificate auth.
+    .DESCRIPTION
+        Establishes an Exchange Online PowerShell session as the app registration's
+        service principal. The SP must have been added to an Exchange role group
+        (e.g., Organization Management or Recipient Management) via
+        New-ServicePrincipal in EXO during setup.
+    .PARAMETER Organization
+        Tenant primary domain, e.g. contoso.onmicrosoft.com (required).
+    .PARAMETER AppId
+        App registration's Application (client) ID (required).
+    .PARAMETER CertificateThumbprint
+        Thumbprint of the certificate (must be the same one used for Graph).
+    .PARAMETER CertificatePath
+        Alternative: file path to a .pfx/.cer. EXO does NOT accept a SecureString
+        password via the cmdlet — use thumbprint with the cert in the local store
+        if your .pfx is password-protected.
+    .OUTPUTS
+        Boolean — $true on success, $false on failure (with a warning emitted).
+    #>
+    [CmdletBinding(DefaultParameterSetName = 'Thumbprint')]
+    param(
+        [Parameter(Mandatory)][string]$Organization,
+        [Parameter(Mandatory)][string]$AppId,
+
+        [Parameter(Mandatory, ParameterSetName = 'Thumbprint')]
+        [string]$CertificateThumbprint,
+
+        [Parameter(Mandatory, ParameterSetName = 'Path')]
+        [string]$CertificatePath
+    )
+
+    if (-not (Get-Module -ListAvailable -Name ExchangeOnlineManagement)) {
+        Write-Warning "ExchangeOnlineManagement module is not installed. Mailbox/transport actions will be skipped."
+        return $false
+    }
+
+    try {
+        Import-Module ExchangeOnlineManagement -ErrorAction Stop
+        $params = @{
+            AppId        = $AppId
+            Organization = $Organization
+            ShowBanner   = $false
+            ErrorAction  = 'Stop'
+        }
+        if ($PSCmdlet.ParameterSetName -eq 'Thumbprint') {
+            $params['CertificateThumbprint'] = ($CertificateThumbprint -replace '\s','')
+        } else {
+            $params['CertificateFilePath'] = $CertificatePath
+        }
+        Connect-ExchangeOnline @params
+        # App-only EXO does not trigger the WAM bug; safe to disconnect normally.
+        $script:ACRExoUsedDeviceCode = $false
+        Write-Verbose "Connected to Exchange Online (app-only) as $AppId in $Organization."
+        return $true
+    } catch {
+        Write-Warning "Failed to connect to Exchange Online with app-only certificate auth: $($_.Exception.Message)"
+        Write-Warning "Common causes: (1) the service principal has not been registered in EXO via 'New-ServicePrincipal -AppId <id> -ObjectId <spObjectId>'; (2) the SP is not a member of an Exchange role group; (3) certificate not present on this machine."
+        return $false
+    }
+}
+
+function Get-ACROperatorIdentity {
+    <#
+    .SYNOPSIS
+        Resolves the human operator running an app-auth remediation session.
+    .DESCRIPTION
+        The script authenticates as a service principal, so the SPN identity does
+        not identify the analyst. This function returns a structured identity for
+        audit/attribution purposes. By default it captures the current Windows
+        identity; pass -OperatorUpn to override (e.g., when the analyst's local
+        username differs from their corporate UPN).
+    .PARAMETER OperatorUpn
+        Optional override for the operator's UPN/email/display name.
+    .OUTPUTS
+        [PSCustomObject] with DisplayName, Source, AuthMode, AppId, ServicePrincipalObjectId.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter()][string]$OperatorUpn
+    )
+
+    if ($OperatorUpn) {
+        $display = $OperatorUpn
+        $source  = 'Override'
+    } else {
+        try {
+            $display = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        } catch {
+            $display = $env:USERNAME
+        }
+        $source = 'WindowsIdentity'
+    }
+
+    $appId = $null
+    $spObjectId = $null
+    if ($script:ACRAppAuthContext) {
+        $appId = $script:ACRAppAuthContext.ClientId
+    }
+    try {
+        $ctx = Get-MgContext -ErrorAction SilentlyContinue
+        if ($ctx -and $ctx.AuthType -eq 'AppOnly') {
+            $authMode = 'AppOnly'
+            if (-not $appId) { $appId = $ctx.ClientId }
+        } else {
+            $authMode = 'Delegated'
+        }
+    } catch {
+        $authMode = 'Unknown'
+    }
+
+    [PSCustomObject]@{
+        DisplayName               = $display
+        Source                    = $source
+        AuthMode                  = $authMode
+        AppId                     = $appId
+        ServicePrincipalObjectId  = $spObjectId
+        Hostname                  = $env:COMPUTERNAME
+        CapturedAt                = (Get-Date).ToUniversalTime().ToString('o')
+    }
+}
+
 Export-ModuleMember -Function @(
     'Connect-ACRInteractive'
     'Connect-ACRManagedIdentity'
     'Connect-ACRExchangeOnline'
     'Connect-ACRExchangeOnlineMI'
+    'Connect-ACRAppAuth'
+    'Connect-ACRExchangeOnlineApp'
+    'Get-ACROperatorIdentity'
     'Test-ACRExchangeOnlineConnected'
     'Get-ACRUserContext'
     'Disconnect-ACR'

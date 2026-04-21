@@ -15,9 +15,11 @@ If the scripts fail, **always check the preflight output first** — most issues
 5. [Target User Issues](#target-user-issues)
 6. [Exchange Online Issues](#exchange-online-issues)
 7. [Action-Specific Failures](#action-specific-failures)
-8. [Automation / Managed Identity](#automation--managed-identity)
-9. [Performance, Throttling & Timeouts](#performance-throttling--timeouts)
-10. [Output, Logs & Reports](#output-logs--reports)
+8. [App-Only / Certificate Auth](#app-only--certificate-auth-invoke-accountremediationappauthps1)
+9. [Automation / Managed Identity](#automation--managed-identity)
+10. [Performance, Throttling & Timeouts](#performance-throttling--timeouts)
+11. [Output, Logs & Reports](#output-logs--reports)
+12. [Getting More Help](#getting-more-help)
 
 ---
 
@@ -345,6 +347,73 @@ Follow the manual steps in the output: Exchange Admin Center → Organization �
 1. On Windows, install: `Install-Module Microsoft.PowerApps.Administration.PowerShell` (in a Windows PowerShell 5.1 prompt).
 2. On non-Windows hosts, run Power Platform actions separately from a Windows host.
 3. Ensure the operator has a Power Platform admin role or tenant admin role.
+
+---
+
+## App-Only / Certificate Auth (`Invoke-AccountRemediationAppAuth.ps1`)
+
+### Q: `AADSTS65001: The user or administrator has not consented to use the application`
+**Cause:** Admin consent for one or more Graph **application** permissions on the app registration is missing.
+
+**Fix:**
+1. Re-run the setup helper as a Global Admin: `.\src\Setup-ACRAppRegistration.ps1 -TenantId '<tenant>'`. It is idempotent and grants any missing role assignments.
+2. Or manually in the Entra portal → App registrations → ACR app → API permissions → "Grant admin consent for <tenant>".
+
+---
+
+### Q: `AADSTS700016: Application with identifier '<id>' was not found in the directory '<tenant>'`
+**Cause:** Wrong TenantId, wrong ClientId, or the app exists in a different tenant than configured.
+
+**Fix:**
+1. Verify `config/app-auth.json` matches the tenant where setup was run.
+2. Override at the CLI: `-TenantId '...' -ClientId '...'`.
+3. Re-run setup if the app was deleted.
+
+---
+
+### Q: Setup helper completes but `Connect-ExchangeOnline` fails with "User is not assigned to the role"
+**Cause:** `New-ServicePrincipal -AppId -ServiceId` was not run inside Exchange Online, or the SP is not a member of an Exchange role group.
+
+**Fix:**
+1. Re-run setup with EXO step enabled (default), or manually:
+   ```powershell
+   Connect-ExchangeOnline   # interactive, as Global Admin
+   New-ServicePrincipal -AppId <ClientId> -ServiceId <ServicePrincipalObjectId> -DisplayName "ACR App Auth"
+   ```
+2. Verify SP membership in the **Exchange Administrator** directory role (Entra portal → Roles → Exchange Administrator → Assignments).
+
+---
+
+### Q: `Certificate with thumbprint '<x>' not found in CurrentUser\My or LocalMachine\My`
+**Cause:** The cert isn't installed on this workstation, or you ran setup as a different Windows user (cert lives in their `CurrentUser\My`).
+
+**Fix:**
+1. Verify the cert exists for the **same Windows user** that runs the script: `Get-ChildItem Cert:\CurrentUser\My | Where-Object Thumbprint -eq '<thumbprint>'`.
+2. If you set up on another machine, re-run setup on this workstation. The helper adds a new keyCredential to the existing app registration — no duplicate apps are created.
+3. If using an exportable PFX: `Import-PfxCertificate -FilePath cert.pfx -CertStoreLocation Cert:\CurrentUser\My`.
+
+---
+
+### Q: `Certificate '<x>' expired on <date>`
+**Cause:** The cert lifetime (default 365 days) has elapsed.
+
+**Fix:** Rotate per [Getting Started §4.4](getting-started.md#44-certificate-rotation). Re-run setup to mint a new cert and add it as an additional keyCredential, then update `config/app-auth.json` with the new thumbprint and remove the old keyCredential from the app.
+
+---
+
+### Q: Preflight reports `App is missing N recommended Graph application permission(s)`
+**Cause:** Admin consent is partial — some app role assignments are missing.
+
+**Fix:** Check the preflight `Details.MissingRoles` for the exact list. Re-run setup, or grant the missing roles in the Entra portal under the app's API permissions tab.
+
+---
+
+### Q: Action 1 (Reset password) fails for an admin user with `Insufficient privileges`
+**Cause:** Graph application permission `User.ReadWrite.All` allows resetting non-admin user passwords. Resetting passwords of users in privileged Entra roles requires the SP to additionally hold the **Privileged Authentication Administrator** directory role.
+
+**Fix:**
+1. Assign the SP to "Privileged Authentication Administrator" in Entra (Roles → role → Assignments → Add).
+2. Or escalate the password reset to a Global Admin out-of-band.
 
 ---
 

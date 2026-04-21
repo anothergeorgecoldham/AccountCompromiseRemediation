@@ -38,7 +38,14 @@ function Start-ACRLog {
         [string]$CorrelationId = [guid]::NewGuid().ToString(),
 
         [Parameter()]
-        [string]$AlertSource = 'Manual'
+        [string]$AlertSource = 'Manual',
+
+        [Parameter()]
+        [object]$OperatorIdentity,
+
+        [Parameter()]
+        [ValidateSet('Delegated','AppOnly','ManagedIdentity','Unknown')]
+        [string]$AuthMode = 'Delegated'
     )
 
     if (-not (Test-Path $OutputPath)) {
@@ -53,6 +60,8 @@ function Start-ACRLog {
         CorrelationId     = $CorrelationId
         AlertSource       = $AlertSource
         UserPrincipalName = $UserPrincipalName
+        OperatorIdentity  = $OperatorIdentity
+        AuthMode          = $AuthMode
         StartTime         = (Get-Date).ToUniversalTime().ToString('o')
         EndTime           = $null
         OutputPath        = $OutputPath
@@ -224,6 +233,8 @@ function Stop-ACRLog {
         CorrelationId     = $script:LogSession.CorrelationId
         AlertSource       = $script:LogSession.AlertSource
         UserPrincipalName = $script:LogSession.UserPrincipalName
+        OperatorIdentity  = $script:LogSession.OperatorIdentity
+        AuthMode          = $script:LogSession.AuthMode
         StartTime         = $script:LogSession.StartTime
         EndTime           = $script:LogSession.EndTime
         Summary           = $script:LogSession.Counters
@@ -235,6 +246,8 @@ function Stop-ACRLog {
     $rollbackJournal = [PSCustomObject]@{
         SessionId         = $script:LogSession.SessionId
         UserPrincipalName = $script:LogSession.UserPrincipalName
+        OperatorIdentity  = $script:LogSession.OperatorIdentity
+        AuthMode          = $script:LogSession.AuthMode
         GeneratedAt       = $script:LogSession.EndTime
         Entries           = $script:LogSession.RollbackEntries
     }

@@ -194,11 +194,42 @@ Describe 'ACR.Preflight Module' {
             $result = Test-ACRTargetUserLicenses -UserPrincipalName 'user@contoso.com'
             $result.Status | Should -Be 'Pass'
         }
-
         It 'Warns when user has no licenses' {
             Mock Get-MgUserLicenseDetail -ModuleName ACR.Preflight { return @() }
             $result = Test-ACRTargetUserLicenses -UserPrincipalName 'user@contoso.com'
             $result.Status | Should -Be 'Warning'
+        }
+
+        It 'Passes for M365 Business Standard via ServicePlans (regression for issue where O365_BUSINESS_PREMIUM was flagged as no-Exchange)' {
+            Mock Get-MgUserLicenseDetail -ModuleName ACR.Preflight {
+                @(
+                    [PSCustomObject]@{
+                        SkuPartNumber = 'O365_BUSINESS_PREMIUM'
+                        ServicePlans  = @(
+                            [PSCustomObject]@{ ServicePlanName = 'EXCHANGE_S_STANDARD'; ProvisioningStatus = 'Success' }
+                            [PSCustomObject]@{ ServicePlanName = 'AAD_PREMIUM';         ProvisioningStatus = 'Success' }
+                        )
+                    }
+                )
+            }
+            $result = Test-ACRTargetUserLicenses -UserPrincipalName 'user@contoso.com'
+            $result.Status | Should -Be 'Pass'
+        }
+
+        It 'Warns when ServicePlans show no Exchange entitlement' {
+            Mock Get-MgUserLicenseDetail -ModuleName ACR.Preflight {
+                @(
+                    [PSCustomObject]@{
+                        SkuPartNumber = 'AAD_PREMIUM'
+                        ServicePlans  = @(
+                            [PSCustomObject]@{ ServicePlanName = 'AAD_PREMIUM'; ProvisioningStatus = 'Success' }
+                        )
+                    }
+                )
+            }
+            $result = Test-ACRTargetUserLicenses -UserPrincipalName 'user@contoso.com'
+            $result.Status  | Should -Be 'Warning'
+            $result.Message | Should -Match 'Exchange'
         }
     }
 
@@ -291,6 +322,69 @@ Describe 'ACR.Preflight Module' {
 
             $result.Ready | Should -BeFalse
             $result.BlockingFailures.Count | Should -BeGreaterThan 0
+        }
+
+        It '-AuthMode AppOnly skips Test-ACROperatorRoles and runs Test-ACRAppAuthContext' {
+            Mock Get-MgContext -ModuleName ACR.Preflight {
+                [PSCustomObject]@{ AuthType = 'AppOnly'; ClientId = 'app-1'; TenantId = 't-1' }
+            }
+            Mock Get-MgUser -ModuleName ACR.Preflight {
+                [PSCustomObject]@{ Id='u1'; UserPrincipalName='user@contoso.com'; DisplayName='U'; AccountEnabled=$true; UserType='Member' }
+            }
+            Mock Test-ACRExchangeOnlineConnected -ModuleName ACR.Preflight { return $true }
+            Mock Get-MgUserLicenseDetail -ModuleName ACR.Preflight {
+                @([PSCustomObject]@{ SkuPartNumber='ENTERPRISEPACK' }, [PSCustomObject]@{ SkuPartNumber='AAD_PREMIUM' })
+            }
+            Mock Invoke-MgGraphRequest -ModuleName ACR.Preflight {
+                param($Method, $Uri)
+                if ($Uri -like "/v1.0/servicePrincipals(appId=*") { return @{ id = 'sp-1' } }
+                if ($Uri -like "/v1.0/servicePrincipals/sp-1/appRoleAssignments") {
+                    return @{ value = @(
+                        @{ resourceId='graph-sp'; appRoleId='r1' },
+                        @{ resourceId='graph-sp'; appRoleId='r2' }
+                    ) }
+                }
+                if ($Uri -eq "/v1.0/servicePrincipals/graph-sp") {
+                    return @{ appRoles = @(
+                        @{ id='r1'; value='User.ReadWrite.All' },
+                        @{ id='r2'; value='Directory.Read.All' }
+                    ) }
+                }
+                return @{ value = @() }
+            }
+            Mock Test-ACROperatorRoles -ModuleName ACR.Preflight { throw 'should not be called in AppOnly' }
+            Mock Test-ACROperatorPimRoles -ModuleName ACR.Preflight { throw 'should not be called in AppOnly' }
+
+            $result = Invoke-ACRPreflight -UserPrincipalName 'user@contoso.com' -SkipAuditCheck -AuthMode AppOnly
+
+            $result.AuthMode | Should -Be 'AppOnly'
+            ($result.Checks | Where-Object Name -eq 'AppAuthContext') | Should -Not -BeNullOrEmpty
+            ($result.Checks | Where-Object Name -eq 'OperatorRoles')  | Should -BeNullOrEmpty
+            Should -Invoke Test-ACROperatorRoles -ModuleName ACR.Preflight -Times 0
+        }
+
+        It 'Test-ACRAppAuthContext warns when required app roles are missing' {
+            Mock Get-MgContext -ModuleName ACR.Preflight {
+                [PSCustomObject]@{ AuthType = 'AppOnly'; ClientId = 'app-1'; TenantId = 't-1' }
+            }
+            Mock Invoke-MgGraphRequest -ModuleName ACR.Preflight {
+                param($Method, $Uri)
+                if ($Uri -like "/v1.0/servicePrincipals(appId=*") { return @{ id = 'sp-1' } }
+                if ($Uri -like "/v1.0/servicePrincipals/sp-1/appRoleAssignments") { return @{ value = @() } }
+                return @{ value = @() }
+            }
+            $check = Test-ACRAppAuthContext -RequiredAppRoles @('User.ReadWrite.All')
+            $check.Status | Should -Be 'Warning'
+            $check.Message | Should -Match 'missing'
+        }
+
+        It 'Test-ACRAppAuthContext fails when AuthType is Delegated' {
+            Mock Get-MgContext -ModuleName ACR.Preflight {
+                [PSCustomObject]@{ AuthType = 'Delegated'; Account = 'me@contoso.com' }
+            }
+            $check = Test-ACRAppAuthContext
+            $check.Status   | Should -Be 'Fail'
+            $check.Blocking | Should -BeTrue
         }
 
         It 'Format-ACRPreflightReport returns a non-empty string' {

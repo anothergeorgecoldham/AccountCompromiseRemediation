@@ -45,6 +45,23 @@ PowerShell-based toolkit for remediating compromised Entra ID accounts. Provides
 
 > **💡 Preflight validation** runs automatically before any remediation. It verifies PowerShell version, module installations, Graph/EXO connectivity, operator admin roles, and target user existence. Blocking issues abort the run; warnings prompt for confirmation.
 
+### Interactive Mode (App-Only / Low-Privilege Operator)
+
+For SOC analysts who don't hold privileged Entra roles, use the third entry script. It authenticates as a dedicated app registration via certificate, so the analyst's own roles are irrelevant.
+
+```powershell
+# One-time setup (Global Admin runs this once per tenant)
+.\src\Setup-ACRAppRegistration.ps1
+
+# Analyst runs the same interactive UX, with app-only auth
+.\src\Invoke-AccountRemediationAppAuth.ps1 -UserPrincipalName "user@contoso.com"
+
+# All the same flags work
+.\src\Invoke-AccountRemediationAppAuth.ps1 -UserPrincipalName "user@contoso.com" -RunAll -SkipForensics
+```
+
+See [Getting Started → App-Only Mode](getting-started.md#app-only--low-privilege-operator-mode) for the setup walkthrough, certificate distribution, and rotation guidance.
+
 ### Non-Interactive / Automation Mode
 ```powershell
 # Called from Logic App or Azure Automation with Managed Identity
@@ -84,8 +101,10 @@ src/
     ACR.Remediation.psm1   # Individual remediation action functions
     ACR.Logging.psm1       # Structured logging & rollback journal
     ACR.Reporting.psm1     # Report generation (JSON, CSV, HTML)
-  Invoke-AccountRemediation.ps1   # Interactive script
+  Invoke-AccountRemediation.ps1   # Interactive script (delegated auth)
+  Invoke-AccountRemediationAppAuth.ps1  # Interactive script (app-only / certificate auth)
   Invoke-AutoRemediation.ps1      # Non-interactive automation script
+  Setup-ACRAppRegistration.ps1    # One-time setup helper for app-only auth
 tests/                     # Pester 5 test suite
 config/
   permissions.json         # Required API permissions reference
@@ -160,4 +179,6 @@ The non-interactive script is designed to be called from an Azure Logic App:
 
 ## License
 
-Internal use only. Not for distribution.
+Released under the [MIT License](LICENSE). Copyright © 2026 George Coldham.
+
+> ⚠ **Disclaimer**: This toolkit performs destructive remediation actions against production tenants (password resets, token revocation, mailbox rule deletion, app consent removal, etc.). Test thoroughly in a non-production tenant first. The authors accept no liability for misuse, mis-targeting, or unintended impact — see the warranty disclaimer in the LICENSE file.

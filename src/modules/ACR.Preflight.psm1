@@ -320,11 +320,36 @@ function Test-ACRTargetUserLicenses {
     }
 
     $skus = @($licenses | ForEach-Object { $_.SkuPartNumber })
-    $hasExchange = $skus | Where-Object {
-        $_ -match '^(SPE|SPB|ENTERPRISEPACK|STANDARDPACK|DEVELOPERPACK|EXCHANGESTANDARD|EXCHANGEENTERPRISE|M365_F)'
+
+    # Preferred detection: inspect ServicePlans for the actual service entitlements.
+    # This is robust to the ever-growing SKU catalog (Business Basic/Standard, EDU,
+    # Frontline, standalone Exchange, etc.). Fall back to SKU-prefix matching when
+    # ServicePlans are not populated (e.g., in unit tests or partial Graph responses).
+    $servicePlans = @()
+    foreach ($lic in $licenses) {
+        if ($lic.PSObject.Properties['ServicePlans'] -and $lic.ServicePlans) {
+            foreach ($sp in $lic.ServicePlans) {
+                # Only count plans actively provisioned for this user
+                if (-not $sp.ProvisioningStatus -or $sp.ProvisioningStatus -in @('Success','PendingProvisioning','PendingActivation')) {
+                    $servicePlans += $sp.ServicePlanName
+                }
+            }
+        }
     }
-    $hasEntraP1 = $skus | Where-Object {
-        $_ -match '^(SPE|AAD_PREMIUM|EMS|EMSPREMIUM|ENTERPRISEPREMIUM|IDENTITY_THREAT_PROTECTION)'
+
+    if ($servicePlans.Count -gt 0) {
+        $hasExchange = $servicePlans | Where-Object { $_ -like 'EXCHANGE_S_*' -or $_ -eq 'EXCHANGE_B_STANDARD' -or $_ -like 'EXCHANGE_*_STANDARD' -or $_ -like 'EXCHANGE_*_ENTERPRISE' }
+        $hasEntraP1  = $servicePlans | Where-Object { $_ -in @('AAD_PREMIUM','AAD_PREMIUM_P2') }
+    }
+    else {
+        # SKU-prefix fallback. Broadened to cover common SMB, EDU, Frontline,
+        # standalone Exchange, and developer SKUs.
+        $hasExchange = $skus | Where-Object {
+            $_ -match '^(SPE|SPB|ENTERPRISEPACK|STANDARDPACK|STANDARDWOFFPACK|MIDSIZEPACK|DEVELOPERPACK|EXCHANGESTANDARD|EXCHANGEENTERPRISE|EXCHANGE_S_|EXCHANGE_L_|M365_F|M365EDU|O365_BUSINESS|SMB_BUSINESS|O365_w/o)'
+        }
+        $hasEntraP1 = $skus | Where-Object {
+            $_ -match '^(SPE|AAD_PREMIUM|EMS|EMSPREMIUM|ENTERPRISEPREMIUM|IDENTITY_THREAT_PROTECTION|M365EDU_A[35])'
+        }
     }
 
     $warnings = @()
@@ -405,6 +430,103 @@ function Test-ACROperatorPimRoles {
     }
 }
 
+function Test-ACRAppAuthContext {
+    <#
+    .SYNOPSIS
+        Validates an app-only Graph context (used by Invoke-AccountRemediationAppAuth).
+    .DESCRIPTION
+        When running with certificate auth, Test-ACRGraphConnection's delegated-scope
+        check is meaningless (app permissions don't appear in $context.Scopes). This
+        check confirms the context is AppOnly, captures the granted application
+        permissions from the access token's 'roles' claim, and warns if any
+        recommended Graph application permission is missing.
+    #>
+    [CmdletBinding()]
+    param(
+        [string[]]$RequiredAppRoles = @(
+            'User.ReadWrite.All',
+            'Directory.Read.All',
+            'AuditLog.Read.All',
+            'MailboxSettings.ReadWrite',
+            'Calendars.ReadWrite',
+            'Files.ReadWrite.All',
+            'UserAuthenticationMethod.ReadWrite.All',
+            'DelegatedPermissionGrant.ReadWrite.All',
+            'Application.ReadWrite.All',
+            'GroupMember.ReadWrite.All'
+        )
+    )
+
+    try {
+        $context = Get-MgContext -ErrorAction Stop
+    } catch {
+        return New-ACRPreflightCheck -Name 'AppAuthContext' -Status 'Fail' -Blocking $true `
+            -Message "Not connected to Microsoft Graph. Run Connect-ACRAppAuth first." `
+            -Details @{ Error = "$_" }
+    }
+
+    if (-not $context) {
+        return New-ACRPreflightCheck -Name 'AppAuthContext' -Status 'Fail' -Blocking $true `
+            -Message "No active Microsoft Graph context."
+    }
+
+    if ($context.AuthType -ne 'AppOnly') {
+        return New-ACRPreflightCheck -Name 'AppAuthContext' -Status 'Fail' -Blocking $true `
+            -Message "Expected AppOnly auth but found $($context.AuthType). Use Invoke-AccountRemediation.ps1 for delegated auth, or reconnect with Connect-ACRAppAuth." `
+            -Details @{ AuthType = "$($context.AuthType)" }
+    }
+
+    # Decode the access token's 'roles' claim to enumerate granted app permissions.
+    $grantedRoles = @()
+    try {
+        $token = $null
+        # Microsoft.Graph stores the token internally; the supported way to retrieve
+        # the claims is Get-MgContext (no token exposed) so we issue a tiny request
+        # and rely on the SDK; instead of token introspection, query the SP itself:
+        $sp = Invoke-MgGraphRequest -Method GET -Uri "/v1.0/servicePrincipals(appId='$($context.ClientId)')" -ErrorAction Stop
+        $assignments = Invoke-MgGraphRequest -Method GET -Uri "/v1.0/servicePrincipals/$($sp.id)/appRoleAssignments" -ErrorAction Stop
+        # Resolve appRoleId GUIDs to names by inspecting the resource (Microsoft Graph SP)
+        $resourceCache = @{}
+        foreach ($a in $assignments.value) {
+            if (-not $resourceCache.ContainsKey($a.resourceId)) {
+                try {
+                    $res = Invoke-MgGraphRequest -Method GET -Uri "/v1.0/servicePrincipals/$($a.resourceId)" -ErrorAction Stop
+                    $resourceCache[$a.resourceId] = $res
+                } catch { $resourceCache[$a.resourceId] = $null }
+            }
+            $resource = $resourceCache[$a.resourceId]
+            if ($resource -and $resource.appRoles) {
+                $role = $resource.appRoles | Where-Object { $_.id -eq $a.appRoleId } | Select-Object -First 1
+                if ($role) { $grantedRoles += $role.value }
+            }
+        }
+    } catch {
+        return New-ACRPreflightCheck -Name 'AppAuthContext' -Status 'Warning' `
+            -Message "Connected app-only as $($context.ClientId), but could not enumerate granted app roles: $($_.Exception.Message). Remediation actions may fail if consent is incomplete." `
+            -Details @{ TenantId = $context.TenantId; ClientId = $context.ClientId }
+    }
+
+    $missing = @($RequiredAppRoles | Where-Object { $_ -notin $grantedRoles })
+    if ($missing.Count -gt 0) {
+        return New-ACRPreflightCheck -Name 'AppAuthContext' -Status 'Warning' `
+            -Message "App is missing $($missing.Count) recommended Graph application permission(s). Affected actions will fail. Re-run Setup-ACRAppRegistration.ps1 to grant consent." `
+            -Details @{
+                TenantId      = $context.TenantId
+                ClientId      = $context.ClientId
+                MissingRoles  = $missing
+                GrantedRoles  = $grantedRoles
+            }
+    }
+
+    New-ACRPreflightCheck -Name 'AppAuthContext' -Status 'Pass' `
+        -Message "App-only Graph context active. $($grantedRoles.Count) application permission(s) granted." `
+        -Details @{
+            TenantId     = $context.TenantId
+            ClientId     = $context.ClientId
+            GrantedRoles = $grantedRoles
+        }
+}
+
 function Invoke-ACRPreflight {
     <#
     .SYNOPSIS
@@ -419,6 +541,10 @@ function Invoke-ACRPreflight {
         Skips the target user existence check (use when running before UPN known).
     .PARAMETER SkipAuditCheck
         Skips the unified audit log enablement check (slow, requires EXO).
+    .PARAMETER AuthMode
+        'Delegated' (default) runs the operator-role and PIM checks. 'AppOnly' skips
+        operator-identity checks (irrelevant under app-only auth) and instead validates
+        the app's granted application permissions via Test-ACRAppAuthContext.
     .EXAMPLE
         $preflight = Invoke-ACRPreflight -UserPrincipalName 'user@contoso.com'
         if (-not $preflight.Ready) { throw 'Preflight failed — see $preflight.Checks' }
@@ -427,16 +553,24 @@ function Invoke-ACRPreflight {
     param(
         [Parameter()][string]$UserPrincipalName,
         [switch]$SkipUserCheck,
-        [switch]$SkipAuditCheck
+        [switch]$SkipAuditCheck,
+        [ValidateSet('Delegated','AppOnly')][string]$AuthMode = 'Delegated'
     )
 
     $checks = @()
 
     $checks += Test-ACRPowerShellVersion
     $checks += Test-ACRModuleVersions
-    $checks += Test-ACRGraphConnection
-    $checks += Test-ACROperatorRoles
-    $checks += Test-ACROperatorPimRoles
+
+    if ($AuthMode -eq 'AppOnly') {
+        $checks += Test-ACRAppAuthContext
+        # Operator-role and PIM checks are meaningless under app-only auth.
+    } else {
+        $checks += Test-ACRGraphConnection
+        $checks += Test-ACROperatorRoles
+        $checks += Test-ACROperatorPimRoles
+    }
+
     $checks += Test-ACRExchangeOnlineSession
 
     if (-not $SkipAuditCheck) {
@@ -459,6 +593,7 @@ function Invoke-ACRPreflight {
         WarningCount     = $warnings.Count
         FailCount        = $failures.Count
         BlockingFailures = $blockingFailures
+        AuthMode         = $AuthMode
         Timestamp        = (Get-Date).ToUniversalTime()
     }
 }
@@ -498,6 +633,7 @@ Export-ModuleMember -Function @(
     'Test-ACRPowerShellVersion'
     'Test-ACRModuleVersions'
     'Test-ACRGraphConnection'
+    'Test-ACRAppAuthContext'
     'Test-ACROperatorRoles'
     'Test-ACROperatorPimRoles'
     'Test-ACRExchangeOnlineSession'

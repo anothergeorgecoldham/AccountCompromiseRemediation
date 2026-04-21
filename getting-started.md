@@ -9,12 +9,13 @@ This guide walks you through setting up, running, and deploying the Account Comp
 1. [Prerequisites](#1-prerequisites)
 2. [Installation](#2-installation)
 3. [Running Interactively — Security Best Practices](#3-running-interactively--security-best-practices)
-4. [Deploying to Azure Automation — Best Practices](#4-deploying-to-azure-automation--best-practices)
-5. [Integrating with Microsoft Sentinel](#5-integrating-with-microsoft-sentinel)
-6. [Integrating with Microsoft Defender XDR](#6-integrating-with-microsoft-defender-xdr)
-7. [Integrating with Microsoft Security Copilot](#7-integrating-with-microsoft-security-copilot)
-8. [Operational Runbook — Before, During, and After](#8-operational-runbook--before-during-and-after)
-9. [Troubleshooting](#9-troubleshooting)
+4. [App-Only / Low-Privilege Operator Mode](#4-app-only--low-privilege-operator-mode)
+5. [Deploying to Azure Automation — Best Practices](#5-deploying-to-azure-automation--best-practices)
+6. [Integrating with Microsoft Sentinel](#6-integrating-with-microsoft-sentinel)
+7. [Integrating with Microsoft Defender XDR](#7-integrating-with-microsoft-defender-xdr)
+8. [Integrating with Microsoft Security Copilot](#8-integrating-with-microsoft-security-copilot)
+9. [Operational Runbook — Before, During, and After](#9-operational-runbook--before-during-and-after)
+10. [Troubleshooting](#10-troubleshooting)
 
 ---
 
@@ -197,11 +198,106 @@ After remediation, the scripts produce three critical files:
 
 ---
 
-## 4. Deploying to Azure Automation — Best Practices
+## 4. App-Only / Low-Privilege Operator Mode
+
+The default interactive script (`Invoke-AccountRemediation.ps1`) authenticates the **operator**, so every analyst must hold privileged Entra roles (User Admin, Exchange Admin, Application Admin, etc.). In real SOC operations this is undesirable — Tier-1/2 analysts should not carry Global Admin.
+
+The third entry script — **`Invoke-AccountRemediationAppAuth.ps1`** — solves this. It authenticates as a dedicated **app registration using a client certificate**. The app holds the Graph application permissions and the EXO service-principal role; the analyst inherits the app's authority. Their personal roles are irrelevant.
+
+> 💡 **When to use this mode**: any environment where the operator does not have (or should not have) Global Admin / Exchange Admin / Application Admin. Cert auth is non-interactive — no MFA prompt — so this mode also works on jumpboxes and PAWs.
+
+### 4.1 One-time setup (Global Admin)
+
+A single Global Admin (or Privileged Role Admin) runs `Setup-ACRAppRegistration.ps1` once per tenant. It is idempotent — safe to re-run.
+
+```powershell
+# Default settings: cert subject 'CN=ACR-AppAuth', app name 'ACR Account Remediation (App Auth)', 365-day cert
+.\src\Setup-ACRAppRegistration.ps1 -TenantId 'contoso.onmicrosoft.com'
+
+# Preview without changes
+.\src\Setup-ACRAppRegistration.ps1 -TenantId 'contoso.onmicrosoft.com' -WhatIf
+
+# Skip the EXO step if you don't need mailbox actions yet
+.\src\Setup-ACRAppRegistration.ps1 -TenantId 'contoso.onmicrosoft.com' -SkipExchangeRole -SkipExchangeServicePrincipal
+```
+
+The setup helper performs nine steps:
+1. Connects to Microsoft Graph as the running user (Global Admin / Privileged Role Admin required)
+2. Generates a self-signed cert in `Cert:\CurrentUser\My` (2048-bit RSA, SHA-256, **non-exportable**, 365-day validity)
+3. Creates (or reuses) the Entra app registration
+4. Attaches the cert public key as a `keyCredential`
+5. Creates the corresponding service principal
+6. Grants admin consent for each Graph application permission listed in `config/permissions.json` (`applicationPermissionsAppAuth.graphAppRoles`)
+7. Adds the SP to the **Exchange Administrator** directory role
+8. Connects to Exchange Online and runs `New-ServicePrincipal -AppId -ServiceId` so EXO recognises the app
+9. Writes `config/app-auth.json` with `tenantId` / `clientId` / `certificateThumbprint` / `organization`
+
+Final summary prints the cert thumbprint, the app ObjectId, and rotation guidance. The real `config/app-auth.json` is **gitignored** — only the `.example` template is committed.
+
+### 4.2 Running the app-auth script
+
+```powershell
+# Loads config/app-auth.json by default
+.\src\Invoke-AccountRemediationAppAuth.ps1 -UserPrincipalName "user@contoso.com"
+
+# All the same flags as the delegated script
+.\src\Invoke-AccountRemediationAppAuth.ps1 -UserPrincipalName "user@contoso.com" -RunAll -DryRun
+
+# Override config-file values from the CLI
+.\src\Invoke-AccountRemediationAppAuth.ps1 `
+    -UserPrincipalName "user@contoso.com" `
+    -TenantId 'other-tenant.onmicrosoft.com' `
+    -ClientId '<guid>' -CertificateThumbprint '<thumbprint>'
+
+# Use an alternate config file (e.g. one per tenant)
+.\src\Invoke-AccountRemediationAppAuth.ps1 -UserPrincipalName "user@contoso.com" `
+    -ConfigPath 'C:\ACR\configs\contoso-app-auth.json'
+
+# Override operator attribution (default: current Windows identity)
+.\src\Invoke-AccountRemediationAppAuth.ps1 -UserPrincipalName "user@contoso.com" `
+    -OperatorUpn 'jdoe@contoso.com'
+```
+
+**Operator attribution**: under app-only auth, every Graph call happens as the SP. To preserve human accountability, the script captures `[Security.Principal.WindowsIdentity]::GetCurrent().Name` (override with `-OperatorUpn`) and writes it to the action log header **and** every rollback journal entry. Reviewers can attribute actions to the analyst, not just the SPN.
+
+### 4.3 Distributing certificates to additional analysts
+
+Each analyst workstation needs the cert in `Cert:\CurrentUser\My`. The cert is provisioned **non-exportable** by default for security, so you can't simply export the PFX. Two options:
+
+**Option A — Per-machine cert (recommended)**: Re-run `Setup-ACRAppRegistration.ps1` on each new workstation. The helper detects the existing app registration and **adds a new key credential** to it. No duplicate apps, no exportable PFXes, but each analyst's cert is independently revocable.
+
+**Option B — Central exportable PFX**: Re-run setup with `-CertificateExportable` (slightly weaker security; the PFX file is now a transferable secret). Distribute via a secure channel (Privileged Identity vault, smartcard, etc.). Import on each workstation with `Import-PfxCertificate -FilePath <pfx> -CertStoreLocation Cert:\CurrentUser\My`.
+
+> 🛡 **Hardening**: If you use Option B, store the PFX in a Privileged Access Workstation (PAW) only, ACL the cert's private-key file to a specific Windows group (e.g. `SOC-Analysts`), and rotate yearly.
+
+### 4.4 Certificate rotation
+
+Certs default to 365-day validity. To rotate before expiry:
+
+```powershell
+# On the original setup machine
+.\src\Setup-ACRAppRegistration.ps1 -TenantId '...' -CertificateValidityDays 365
+# Setup adds a new keyCredential alongside the old one
+# Update config/app-auth.json (or the analyst-side configs) with the new thumbprint
+# After all workstations are updated and verified, remove the old keyCredential
+# from the app via the Entra portal (App registrations → Certificates & secrets)
+```
+
+Plan rotation 30 days before expiry. The script's preflight will warn (not block) when the cert is within 30 days of expiry.
+
+### 4.5 What's still required
+
+The app-auth flow does **not** eliminate every privileged action:
+- **Power Platform actions (13–15)** require the PowerApps admin module, which has its own auth model. They will be skipped in app-only mode with manual guidance, just like today when the module is missing.
+- **Resetting an admin user's password (Action 1 against an admin)** requires the SP to additionally hold the **Privileged Authentication Administrator** directory role. The setup helper does NOT assign this role by default — add it manually in the Entra portal if needed.
+
+---
+
+## 5. Deploying to Azure Automation — Best Practices
 
 This section follows [Microsoft's Azure Automation security guidelines](https://learn.microsoft.com/en-us/azure/automation/automation-security-guidelines) and [Managed Identity best practices](https://learn.microsoft.com/en-us/azure/automation/enable-managed-identity-for-automation).
 
-### 4.1 Create an Azure Automation Account
+### 5.1 Create an Azure Automation Account
 
 ```bash
 # Azure CLI
@@ -212,7 +308,7 @@ az automation account create \
   --sku "Basic"
 ```
 
-### 4.2 Enable System-Assigned Managed Identity
+### 5.2 Enable System-Assigned Managed Identity
 
 ```bash
 az automation account identity assign \
@@ -223,7 +319,7 @@ az automation account identity assign \
 
 > **Why Managed Identity?** Run As accounts are deprecated. Managed Identity is credential-free, rotated by Azure, and auditable through Entra ID sign-in logs.
 
-### 4.3 Grant Graph API Permissions to the Managed Identity
+### 5.3 Grant Graph API Permissions to the Managed Identity
 
 Use PowerShell to assign application permissions (this requires a Global Administrator):
 
@@ -267,7 +363,7 @@ foreach ($permName in $requiredPermissions) {
 }
 ```
 
-### 4.4 Import Modules into the Automation Account
+### 5.4 Import Modules into the Automation Account
 
 ```bash
 # Import Microsoft.Graph modules (use the Azure Portal for complex dependency chains)
@@ -281,7 +377,7 @@ az automation module create \
 
 > **Tip:** Use the Azure Portal → Automation Account → Modules → Browse Gallery for the simplest experience. Import `Microsoft.Graph.Authentication` first, then the sub-modules (`Microsoft.Graph.Users`, `Microsoft.Graph.Mail`, etc.).
 
-### 4.5 Upload the Runbook Scripts
+### 5.5 Upload the Runbook Scripts
 
 Upload `Invoke-AutoRemediation.ps1` and the `src/modules/` folder as PowerShell 7.2 runbooks:
 
@@ -296,7 +392,7 @@ az automation runbook create \
 
 > **Important:** When deploying to Azure Automation, ensure the module import paths in the script match the Automation Account module structure. You may need to adjust `$PSScriptRoot` references or upload modules as Automation Account modules.
 
-### 4.6 Security Hardening (Per Microsoft Guidelines)
+### 5.6 Security Hardening (Per Microsoft Guidelines)
 
 | Practice | Implementation |
 |---|---|
@@ -309,7 +405,7 @@ az automation runbook create \
 | **Module pinning** | Pin specific module versions in the Automation Account to prevent unexpected updates |
 | **Source control** | Link the Automation Account to a Git repository for version-controlled runbook deployment |
 
-### 4.7 Test Before Production
+### 5.7 Test Before Production
 
 ```powershell
 # Run a test job in Azure Portal or via CLI
@@ -324,9 +420,9 @@ Monitor the job output in the Azure Portal → Automation Account → Jobs.
 
 ---
 
-## 5. Integrating with Microsoft Sentinel
+## 6. Integrating with Microsoft Sentinel
 
-### 5.1 Architecture Overview
+### 6.1 Architecture Overview
 
 ```
 ┌─────────────────┐    Incident     ┌──────────────────┐    Trigger    ┌─────────────────────┐
@@ -344,7 +440,7 @@ Monitor the job output in the Azure Portal → Automation Account → Jobs.
                                     (Teams/email/ticket)                + rollback journal
 ```
 
-### 5.2 Create a Sentinel Playbook (Logic App)
+### 6.2 Create a Sentinel Playbook (Logic App)
 
 1. **Navigate to:** Microsoft Sentinel → Automation → Create Playbook
 2. **Trigger:** "When Microsoft Sentinel incident creation rule was triggered"
@@ -358,7 +454,7 @@ Monitor the job output in the Azure Portal → Automation Account → Jobs.
      - If `status == "Failed"` → escalate, send Teams alert
    - **Optional:** Post results to a Teams channel, ServiceNow ticket, or email
 
-### 5.3 Recommended Analytics Rules to Trigger Remediation
+### 6.3 Recommended Analytics Rules to Trigger Remediation
 
 | Analytics Rule | Signal Source | Trigger Condition |
 |---|---|---|
@@ -369,7 +465,7 @@ Monitor the job output in the Azure Portal → Automation Account → Jobs.
 | **Consent phishing** | Audit logs | User grants consent to unfamiliar OAuth app with broad scopes |
 | **MFA fatigue / push spam** | Entra ID sign-in logs | Multiple denied MFA requests followed by an approval |
 
-### 5.4 Sentinel-Specific Best Practices
+### 6.4 Sentinel-Specific Best Practices
 
 - **Use the Azure Automation connector** in Logic Apps, not HTTP webhooks — the connector uses Managed Identity natively and is auditable
 - **Add an approval step** for high-value targets (VIPs, admin accounts) — use a Teams Adaptive Card or email approval before executing remediation
@@ -379,9 +475,9 @@ Monitor the job output in the Azure Portal → Automation Account → Jobs.
 
 ---
 
-## 6. Integrating with Microsoft Defender XDR
+## 7. Integrating with Microsoft Defender XDR
 
-### 6.1 Complementing Automatic Attack Disruption
+### 7.1 Complementing Automatic Attack Disruption
 
 Microsoft Defender XDR's built-in [Automatic Attack Disruption](https://learn.microsoft.com/en-us/defender-xdr/configure-attack-disruption) handles immediate containment (disabling compromised accounts, isolating devices) with high-confidence AI signals. This toolkit **complements** that by providing:
 
@@ -389,7 +485,7 @@ Microsoft Defender XDR's built-in [Automatic Attack Disruption](https://learn.mi
 - **Comprehensive remediation** — beyond disabling the account, clean up delegates, forwarding, app consents, Power Platform artifacts, etc.
 - **Evidence preservation** — structured exports and rollback journals for incident response
 
-### 6.2 Integration Approach
+### 7.2 Integration Approach
 
 | Defender XDR Action | This Toolkit's Role |
 |---|---|
@@ -397,7 +493,7 @@ Microsoft Defender XDR's built-in [Automatic Attack Disruption](https://learn.mi
 | Incident created in XDR | Forward to Sentinel → trigger playbook → invoke `Invoke-AutoRemediation.ps1` |
 | Manual investigation in XDR portal | Use `Invoke-AccountRemediation.ps1` interactively alongside the XDR investigation |
 
-### 6.3 Connecting Defender XDR to Sentinel
+### 7.3 Connecting Defender XDR to Sentinel
 
 If you use both Defender XDR and Sentinel:
 
@@ -405,7 +501,7 @@ If you use both Defender XDR and Sentinel:
 2. Create an **automation rule** in Sentinel that triggers the remediation playbook when a Defender XDR incident with compromised-user entities is imported
 3. The `CorrelationId` parameter in `Invoke-AutoRemediation.ps1` maps directly to the Defender XDR incident ID for traceability
 
-### 6.4 Custom Detection Rules
+### 7.4 Custom Detection Rules
 
 Create custom detection rules in Defender XDR Advanced Hunting to trigger this toolkit:
 
@@ -426,13 +522,13 @@ Route matching incidents to Sentinel for automated playbook execution.
 
 ---
 
-## 7. Integrating with Microsoft Security Copilot
+## 8. Integrating with Microsoft Security Copilot
 
-### 7.1 Overview
+### 8.1 Overview
 
 [Microsoft Security Copilot](https://learn.microsoft.com/en-us/security-copilot/) is an AI-powered assistant that can investigate, summarise, and orchestrate security operations. This toolkit integrates with Copilot through its **custom plugin** and **Logic App automation** extensibility.
 
-### 7.2 Use Cases
+### 8.2 Use Cases
 
 | Scenario | How It Works |
 |---|---|
@@ -440,7 +536,7 @@ Route matching incidents to Sentinel for automated playbook execution.
 | **Copilot triggers automated remediation** | Copilot invokes a Sentinel playbook that triggers `Invoke-AutoRemediation.ps1` |
 | **Copilot reviews remediation results** | Feed the JSON output from `Invoke-AutoRemediation.ps1` back to Copilot for summarisation and next-step recommendations |
 
-### 7.3 Building a Security Copilot Custom Plugin
+### 8.3 Building a Security Copilot Custom Plugin
 
 Register a custom plugin that exposes the remediation toolkit as a Copilot skill:
 
@@ -476,7 +572,7 @@ paths:
 
 The plugin backend is a Logic App that invokes the Azure Automation runbook and returns the JSON result.
 
-### 7.4 Prompting Security Copilot
+### 8.4 Prompting Security Copilot
 
 Once integrated, analysts can use natural language prompts:
 
@@ -488,9 +584,9 @@ Once integrated, analysts can use natural language prompts:
 
 ---
 
-## 8. Operational Runbook — Before, During, and After
+## 9. Operational Runbook — Before, During, and After
 
-### 8.1 Before an Incident (Preparation)
+### 9.1 Before an Incident (Preparation)
 
 - [ ] Install and test the scripts in a non-production environment
 - [ ] Run the Pester test suite to verify: `Invoke-Pester -Path ./tests -Output Detailed`
@@ -500,7 +596,7 @@ Once integrated, analysts can use natural language prompts:
 - [ ] Train SOC analysts on using the interactive script
 - [ ] Store the toolkit in a version-controlled, access-restricted repository
 
-### 8.2 During an Incident
+### 9.2 During an Incident
 
 1. **Triage** — Confirm the compromise signal (Sentinel alert, user report, Defender XDR incident)
 2. **Forensics first** — Run the toolkit. Review the HTML forensic report before taking action
@@ -509,7 +605,7 @@ Once integrated, analysts can use natural language prompts:
 5. **Verify** — Check the action log. Were any actions "Failed" or "Warning"? Address those manually
 6. **Communicate** — Notify the user that their password has been reset and they must re-authenticate. Coordinate with the help desk
 
-### 8.3 After an Incident
+### 9.3 After an Incident
 
 - [ ] Preserve all output files (action log, rollback journal, forensic exports, HTML report) in your case management system
 - [ ] Review the rollback journal — if the incident was a false positive, use the recorded before/after state to reverse changes
@@ -523,7 +619,7 @@ Once integrated, analysts can use natural language prompts:
 
 ---
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 ### Common Issues
 
